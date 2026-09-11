@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import keyring
 
 from remctl import __version__
+from remctl.ssh import run_ssh, validate_ssh_credential
 
 KEYRING_INDEX_SERVICE = "remctl:index"
 KEYRING_INDEX_ACCOUNT = "hosts"
@@ -48,9 +49,7 @@ def load_host_index() -> dict[str, list[str]]:
         raise ValueError("stored host index has an invalid format") from error
 
     if isinstance(index, list):
-        if all(isinstance(host, str) and host for host in index):
-            return {}
-        raise ValueError("stored host index has an invalid format")
+        raise ValueError("stored host index uses an obsolete format; run rctl reindex")
 
     if not isinstance(index, dict) or not all(
         isinstance(host, str)
@@ -101,6 +100,31 @@ def unregister_host(host: str, username: str) -> None:
         save_host_index(index)
 
 
+def save_host_credential(host: str, username: str, password: str) -> None:
+    """Index and save a credential, rolling back a new index entry on failure."""
+    index = load_host_index()
+    already_indexed = username in index.get(host, [])
+    if not already_indexed:
+        register_host(host, username)
+    try:
+        keyring.set_password(credential_service(host), username, password)
+    except keyring.errors.KeyringError:
+        if not already_indexed:
+            unregister_host(host, username)
+        raise
+
+
+def delete_host_credential(host: str, username: str, password: str) -> None:
+    """Delete a credential and restore it if index updating fails."""
+    service = credential_service(host)
+    keyring.delete_password(service, username)
+    try:
+        unregister_host(host, username)
+    except (keyring.errors.KeyringError, ValueError):
+        keyring.set_password(service, username, password)
+        raise
+
+
 def add_host(host: str) -> int:
     """Prompt for and securely store a host credential."""
     username = input("username: ").strip()
@@ -113,19 +137,87 @@ def add_host(host: str) -> int:
         print("error: password cannot be empty", file=sys.stderr)
         return 2
 
+    print(f"Validating SSH credential for {username}@{host}...")
+    if not validate_ssh_credential(host, username, password):
+        print("error: SSH credential validation failed", file=sys.stderr)
+        return 1
+
     try:
-        keyring.set_password(
-            credential_service(host),
-            username,
-            password,
-        )
-        register_host(host, username)
+        save_host_credential(host, username, password)
     except (keyring.errors.KeyringError, ValueError) as error:
         print(f"error: unable to save credential: {error}", file=sys.stderr)
         return 1
 
     print(f"Credential saved for {username}@{host}")
     return 0
+
+
+def reindex_hosts() -> int:
+    """Remove stale index entries and reset an invalid index."""
+    try:
+        try:
+            index = load_host_index()
+        except ValueError:
+            save_host_index({})
+            print("Host index was invalid and has been reset.")
+            return 0
+
+        repaired: dict[str, list[str]] = {}
+        removed = 0
+        for host, usernames in index.items():
+            for username in usernames:
+                credential = load_host_credential(host, username)
+                if credential is None:
+                    removed += 1
+                    continue
+                if not credential.password:
+                    keyring.delete_password(credential_service(host), username)
+                    removed += 1
+                    continue
+                repaired.setdefault(host, []).append(username)
+
+        if repaired != index:
+            save_host_index(repaired)
+    except keyring.errors.KeyringError as error:
+        print(f"error: unable to repair host index: {error}", file=sys.stderr)
+        return 1
+
+    valid = sum(len(usernames) for usernames in repaired.values())
+    if removed:
+        print(f"Host index repaired: {valid} valid, {removed} removed.")
+    else:
+        print(f"Host index is consistent: {valid} credentials.")
+    return 0
+
+
+def ssh_host(host: str, username: str | None = None) -> int:
+    """Open an interactive SSH session using a stored credential."""
+    try:
+        index = load_host_index()
+        usernames = index.get(host, [])
+        if username is None:
+            if len(usernames) > 1:
+                print(
+                    "error: multiple credentials found; specify --user",
+                    file=sys.stderr,
+                )
+                return 2
+            if len(usernames) == 1:
+                username = usernames[0]
+
+        if username is None:
+            print(f"error: no credential found for {host}", file=sys.stderr)
+            return 1
+
+        credential = load_host_credential(host, username)
+    except (keyring.errors.KeyringError, ValueError) as error:
+        print(f"error: unable to read credential: {error}", file=sys.stderr)
+        return 1
+
+    if credential is None:
+        print(f"error: no credential found for {username}@{host}", file=sys.stderr)
+        return 1
+    return run_ssh(host, credential.username, credential.password)
 
 
 def get_host(host: str, username: str | None = None) -> int:
@@ -213,8 +305,11 @@ def delete_host(
             credential = load_host_credential(host, target_username)
             if credential is None:
                 continue
-            keyring.delete_password(credential_service(host), target_username)
-            unregister_host(host, target_username)
+            delete_host_credential(
+                host,
+                target_username,
+                credential.password,
+            )
             deleted.append(credential)
     except (keyring.errors.KeyringError, ValueError) as error:
         print(f"error: unable to delete credential: {error}", file=sys.stderr)
@@ -262,6 +357,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="list all saved remote hosts",
     )
     list_parser.set_defaults(handler=lambda args: list_hosts())
+
+    reindex_parser = subparsers.add_parser(
+        "reindex",
+        help="check and repair the host credential index",
+    )
+    reindex_parser.set_defaults(handler=lambda args: reindex_hosts())
+
+    ssh_parser = subparsers.add_parser(
+        "ssh",
+        help="open an SSH session using a saved credential",
+    )
+    ssh_parser.add_argument("host", help="hostname or IP address")
+    ssh_parser.add_argument("-u", "--user", help="username to use")
+    ssh_parser.set_defaults(handler=lambda args: ssh_host(args.host, args.user))
 
     delete_parser = subparsers.add_parser(
         "delete",

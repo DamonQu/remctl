@@ -10,10 +10,12 @@ operations. Its command-line program is `rctl`.
 - Query a stored host without revealing its password.
 - List all hosts managed by `remctl` without revealing passwords.
 - Delete a host's credentials from the system credential store.
+- Validate credentials with a real SSH login before saving them.
+- Open interactive SSH sessions with saved credentials.
 - Use macOS Keychain through Python's `keyring` package.
 - Keep passwords out of project files and shell command history.
 
-SSH, SCP, and rsync commands will be added in later versions.
+SCP and rsync commands will be added in later versions.
 
 ## Add a host
 
@@ -30,6 +32,7 @@ The command prompts interactively:
 ```text
 username: alice
 password:
+Validating SSH credential for alice@server.example.com...
 Credential saved for alice@server.example.com
 ```
 
@@ -37,6 +40,34 @@ The password input is hidden. Each host uses the Keychain/Keyring service name
 `remctl:<host>`, with the username as its account and the password as its secret.
 Run `rctl add` again with another username to add a credential without
 overwriting the existing account.
+
+Before saving, `rctl add` opens an authentication-only OpenSSH connection. It
+does not start a remote shell or execute a remote command. A failed login is not
+stored. On a first connection, review and confirm the host fingerprint shown by
+OpenSSH.
+
+## Open an SSH session
+
+Connect using the only credential stored for a host:
+
+```sh
+rctl ssh 10.0.0.11
+```
+
+If the host has multiple accounts, select one explicitly:
+
+```sh
+rctl ssh 10.0.0.11 --user root
+```
+
+The password is read from Keychain/Keyring and sent directly to the OpenSSH
+pseudo-terminal. It is never added to process arguments or printed.
+
+If OpenSSH reports that the host key has changed, `rctl` asks before running
+`ssh-keygen -R <host>` to remove the stale entry from `~/.ssh/known_hosts`. It
+then retries and lets OpenSSH display the new fingerprint for confirmation.
+Never approve a changed key until its new fingerprint has been verified through
+a trusted channel.
 
 ## Query a host
 
@@ -79,9 +110,22 @@ The `ls` alias is also available. Passwords are never included in list output.
 The host index is stored in Keychain/Keyring under the `remctl:index` service,
 not in a plaintext project file.
 
+Check the index against Keychain/Keyring and remove stale entries:
+
+```sh
+rctl reindex
+```
+
+An invalid index is reset. An index entry whose password no longer exists is
+removed, and an empty invalid credential is deleted. Credential and index
+updates use repairable ordering and best-effort rollback to prevent new
+inconsistencies.
+Because the cross-platform `keyring` API cannot enumerate arbitrary entries,
+`reindex` cannot discover credentials that were created outside the index.
+
 Credentials created by an earlier development version used a different storage
-layout and cannot be discovered automatically. Run `rctl add <host>` again for
-each account to store it in the multi-user layout.
+layout and cannot be discovered automatically. Run `rctl reindex` once to reset
+the obsolete index, then run `rctl add <host>` again for each account.
 
 ## Delete a host
 
