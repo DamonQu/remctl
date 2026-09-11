@@ -7,6 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pexpect
+
 from remctl.ssh import _run_ssh_once, run_ssh, validate_ssh_credential
 
 
@@ -84,7 +86,7 @@ class SshTests(unittest.TestCase):
 
     def test_password_is_sent_to_tty_not_process_arguments(self) -> None:
         child = MagicMock()
-        child.expect.side_effect = [0, 4]
+        child.expect.side_effect = [0, 0]
         child.exitstatus = 0
         child.signalstatus = None
 
@@ -102,7 +104,9 @@ class SshTests(unittest.TestCase):
         self.assertEqual(command, "ssh")
         self.assertNotIn("secret", arguments)
         self.assertIn("root@10.0.0.11", arguments)
+        self.assertIn("-T", arguments)
         child.sendline.assert_called_once_with("secret")
+        child.expect.assert_called_with(pexpect.EOF, timeout=None)
 
     def test_missing_ssh_binary_returns_clean_error(self) -> None:
         error = io.StringIO()

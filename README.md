@@ -69,6 +69,38 @@ then retries and lets OpenSSH display the new fingerprint for confirmation.
 Never approve a changed key until its new fingerprint has been verified through
 a trusted channel.
 
+## Execute a remote command
+
+Run a command with the only credential stored for a host:
+
+```sh
+rctl exec 10.0.0.11 uname -a
+```
+
+Quote commands that contain remote shell operators so the local shell does not
+interpret them first:
+
+```sh
+rctl exec 10.0.0.11 'uptime && df -h'
+```
+
+Remote stdout and stderr are printed directly, and `rctl` exits with the SSH
+process exit code. For a host with multiple accounts, put `--user` before the
+host:
+
+```sh
+rctl exec --user root 10.0.0.11 systemctl status sshd
+```
+
+Use `--` when the remote command itself begins with an option:
+
+```sh
+rctl exec 10.0.0.11 -- -example-command
+```
+
+The command is passed as arguments to OpenSSH; the saved password is never
+included in the process arguments.
+
 ## Query a host
 
 Check whether credentials exist and show the stored username:

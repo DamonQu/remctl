@@ -243,6 +243,61 @@ class CliTests(unittest.TestCase):
         run_ssh.assert_not_called()
         self.assertIn("specify --user", error.getvalue())
 
+    def test_exec_runs_remote_command_and_returns_ssh_exit_code(self) -> None:
+        with (
+            patch(
+                "remctl.cli.load_host_index",
+                return_value={"10.0.0.11": ["root"]},
+            ),
+            patch("remctl.cli.keyring.get_password", return_value="secret"),
+            patch("remctl.cli.run_ssh", return_value=7) as run_ssh,
+        ):
+            exit_code = main(["exec", "10.0.0.11", "uname", "-a"])
+
+        self.assertEqual(exit_code, 7)
+        run_ssh.assert_called_once_with(
+            "10.0.0.11",
+            "root",
+            "secret",
+            remote_command=("uname", "-a"),
+            interactive=False,
+        )
+
+    def test_exec_uses_selected_user_for_multiple_credentials(self) -> None:
+        with (
+            patch(
+                "remctl.cli.load_host_index",
+                return_value={"10.0.0.11": ["admin", "root"]},
+            ),
+            patch("remctl.cli.keyring.get_password", return_value="secret"),
+            patch("remctl.cli.run_ssh", return_value=0) as run_ssh,
+        ):
+            exit_code = main(
+                ["exec", "--user", "root", "10.0.0.11", "hostname"]
+            )
+
+        self.assertEqual(exit_code, 0)
+        run_ssh.assert_called_once_with(
+            "10.0.0.11",
+            "root",
+            "secret",
+            remote_command=("hostname",),
+            interactive=False,
+        )
+
+    def test_exec_rejects_empty_remote_command(self) -> None:
+        error = io.StringIO()
+
+        with (
+            patch("remctl.cli.run_ssh") as run_ssh,
+            contextlib.redirect_stderr(error),
+        ):
+            exit_code = main(["exec", "10.0.0.11"])
+
+        self.assertEqual(exit_code, 2)
+        run_ssh.assert_not_called()
+        self.assertIn("command cannot be empty", error.getvalue())
+
     def test_reindex_removes_missing_credentials(self) -> None:
         output = io.StringIO()
 

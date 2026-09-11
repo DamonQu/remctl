@@ -220,6 +220,53 @@ def ssh_host(host: str, username: str | None = None) -> int:
     return run_ssh(host, credential.username, credential.password)
 
 
+def exec_host(
+    host: str,
+    command: Sequence[str],
+    username: str | None = None,
+) -> int:
+    """Execute a remote command using a stored credential."""
+    remote_command = list(command)
+    if remote_command[:1] == ["--"]:
+        remote_command.pop(0)
+    if not remote_command:
+        print("error: remote command cannot be empty", file=sys.stderr)
+        return 2
+
+    try:
+        index = load_host_index()
+        usernames = index.get(host, [])
+        if username is None:
+            if len(usernames) > 1:
+                print(
+                    "error: multiple credentials found; specify --user",
+                    file=sys.stderr,
+                )
+                return 2
+            if len(usernames) == 1:
+                username = usernames[0]
+
+        if username is None:
+            print(f"error: no credential found for {host}", file=sys.stderr)
+            return 1
+
+        credential = load_host_credential(host, username)
+    except (keyring.errors.KeyringError, ValueError) as error:
+        print(f"error: unable to read credential: {error}", file=sys.stderr)
+        return 1
+
+    if credential is None:
+        print(f"error: no credential found for {username}@{host}", file=sys.stderr)
+        return 1
+    return run_ssh(
+        host,
+        credential.username,
+        credential.password,
+        remote_command=tuple(remote_command),
+        interactive=False,
+    )
+
+
 def get_host(host: str, username: str | None = None) -> int:
     """Show credentials stored for a host without revealing passwords."""
     try:
@@ -371,6 +418,25 @@ def build_parser() -> argparse.ArgumentParser:
     ssh_parser.add_argument("host", help="hostname or IP address")
     ssh_parser.add_argument("-u", "--user", help="username to use")
     ssh_parser.set_defaults(handler=lambda args: ssh_host(args.host, args.user))
+
+    exec_parser = subparsers.add_parser(
+        "exec",
+        help="execute a command on a remote host",
+    )
+    exec_parser.add_argument("-u", "--user", help="username to use")
+    exec_parser.add_argument("host", help="hostname or IP address")
+    exec_parser.add_argument(
+        "remote_command",
+        nargs=argparse.REMAINDER,
+        help="command and arguments to execute remotely",
+    )
+    exec_parser.set_defaults(
+        handler=lambda args: exec_host(
+            args.host,
+            args.remote_command,
+            args.user,
+        )
+    )
 
     delete_parser = subparsers.add_parser(
         "delete",

@@ -59,11 +59,17 @@ def _run_ssh_once(
     """Run one OpenSSH attempt, supplying one password."""
     destination = f"{username}@{host}"
     columns, rows = shutil.get_terminal_size(fallback=(80, 24))
-    mode_options = ("-N", "-v") if authentication_only else ()
+    if authentication_only:
+        mode_options = ("-N", "-v")
+    elif not interactive:
+        mode_options = ("-T",)
+    else:
+        mode_options = ()
     child = pexpect.spawn(
         "ssh",
         [*SSH_OPTIONS, *mode_options, destination, *remote_command],
         encoding="utf-8",
+        codec_errors="replace",
         dimensions=(rows, columns),
     )
     child.logfile_read = sys.stdout
@@ -98,6 +104,9 @@ def _run_ssh_once(
                 if interactive:
                     child.logfile_read = None
                     child.interact()
+                    return _exit_code(child)
+                if not authentication_only:
+                    child.expect(pexpect.EOF, timeout=None)
                     return _exit_code(child)
             elif match == 1:
                 child.sendline(input())
