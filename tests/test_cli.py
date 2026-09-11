@@ -1,0 +1,189 @@
+"""Tests for the remctl command-line interface."""
+
+import contextlib
+import io
+import unittest
+from unittest.mock import patch
+
+from remctl.cli import main
+
+
+class CliTests(unittest.TestCase):
+    def test_no_arguments_prints_help(self) -> None:
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = main([])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("usage: rctl", output.getvalue())
+
+    def test_add_host_saves_credential_in_keyring(self) -> None:
+        output = io.StringIO()
+
+        with (
+            patch("builtins.input", return_value="alice"),
+            patch("remctl.cli.getpass.getpass", return_value="secret"),
+            patch("remctl.cli.keyring.set_password") as set_password,
+            patch("remctl.cli.register_host") as register_host,
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["add", "example.com"])
+
+        self.assertEqual(exit_code, 0)
+        set_password.assert_called_once_with("remctl:example.com", "alice", "secret")
+        register_host.assert_called_once_with("example.com", "alice")
+        self.assertIn("Credential saved for alice@example.com", output.getvalue())
+
+    def test_add_host_rejects_empty_username(self) -> None:
+        error = io.StringIO()
+
+        with (
+            patch("builtins.input", return_value="  "),
+            patch("remctl.cli.keyring.set_password") as set_password,
+            contextlib.redirect_stderr(error),
+        ):
+            exit_code = main(["add", "example.com"])
+
+        self.assertEqual(exit_code, 2)
+        set_password.assert_not_called()
+        self.assertIn("username cannot be empty", error.getvalue())
+
+    def test_get_host_shows_username_without_password(self) -> None:
+        output = io.StringIO()
+        with (
+            patch("remctl.cli.load_host_index", return_value={"example.com": ["alice"]}),
+            patch("remctl.cli.keyring.get_password", return_value="secret"),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["get", "example.com"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("username: alice", output.getvalue())
+        self.assertIn("password: stored", output.getvalue())
+        self.assertNotIn("secret", output.getvalue())
+
+    def test_get_host_reports_missing_credential(self) -> None:
+        error = io.StringIO()
+
+        with (
+            patch("remctl.cli.load_host_index", return_value={}),
+            contextlib.redirect_stderr(error),
+        ):
+            exit_code = main(["get", "missing.example.com"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("no credential found", error.getvalue())
+
+    def test_delete_host_removes_credential(self) -> None:
+        output = io.StringIO()
+        with (
+            patch("remctl.cli.load_host_index", return_value={"example.com": ["alice"]}),
+            patch("remctl.cli.keyring.get_password", return_value="secret"),
+            patch("remctl.cli.keyring.delete_password") as delete_password,
+            patch("remctl.cli.unregister_host") as unregister_host,
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["delete", "example.com"])
+
+        self.assertEqual(exit_code, 0)
+        delete_password.assert_called_once_with("remctl:example.com", "alice")
+        unregister_host.assert_called_once_with("example.com", "alice")
+        self.assertIn("Credential deleted for alice@example.com", output.getvalue())
+
+    def test_list_hosts_shows_hosts_and_usernames_without_passwords(self) -> None:
+        output = io.StringIO()
+        passwords = {"dbadmin": "db-secret", "deploy": "web-secret"}
+
+        with (
+            patch(
+                "remctl.cli.load_host_index",
+                return_value={
+                    "db.example.com": ["dbadmin"],
+                    "web.example.com": ["deploy"],
+                },
+            ),
+            patch(
+                "remctl.cli.keyring.get_password",
+                side_effect=lambda service, username: passwords[username],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["list"])
+
+        result = output.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("db.example.com", result)
+        self.assertIn("dbadmin", result)
+        self.assertIn("web.example.com", result)
+        self.assertIn("deploy", result)
+        self.assertNotIn("db-secret", result)
+        self.assertNotIn("web-secret", result)
+
+    def test_list_hosts_reports_empty_index(self) -> None:
+        output = io.StringIO()
+
+        with (
+            patch("remctl.cli.load_host_index", return_value={}),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["list"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.getvalue(), "No saved hosts.\n")
+
+    def test_delete_requires_username_for_multiple_accounts(self) -> None:
+        error = io.StringIO()
+
+        with (
+            patch(
+                "remctl.cli.load_host_index",
+                return_value={"example.com": ["alice", "root"]},
+            ),
+            contextlib.redirect_stderr(error),
+        ):
+            exit_code = main(["delete", "example.com"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("multiple credentials found", error.getvalue())
+
+    def test_delete_all_removes_every_account_for_host(self) -> None:
+        output = io.StringIO()
+
+        with (
+            patch(
+                "remctl.cli.load_host_index",
+                return_value={"example.com": ["alice", "root"]},
+            ),
+            patch("remctl.cli.keyring.get_password", return_value="secret"),
+            patch("remctl.cli.keyring.delete_password") as delete_password,
+            patch("remctl.cli.unregister_host") as unregister_host,
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["delete", "example.com", "--all"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(delete_password.call_count, 2)
+        delete_password.assert_any_call("remctl:example.com", "alice")
+        delete_password.assert_any_call("remctl:example.com", "root")
+        self.assertEqual(unregister_host.call_count, 2)
+
+    def test_register_host_keeps_multiple_usernames(self) -> None:
+        with (
+            patch(
+                "remctl.cli.load_host_index",
+                return_value={"example.com": ["alice"]},
+            ),
+            patch("remctl.cli.save_host_index") as save_host_index,
+        ):
+            from remctl.cli import register_host
+
+            register_host("example.com", "root")
+
+        save_host_index.assert_called_once_with(
+            {"example.com": ["alice", "root"]}
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

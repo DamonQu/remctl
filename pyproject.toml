@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remctl"
+version = "0.1.0"
+description = "Manage remote host credentials and unified SSH-based operations."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  { name = "Damon Qu" },
+]
+dependencies = [
+  "keyring>=25.7,<26",
+]
+
+[project.scripts]
+rctl = "remctl.cli:main"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
