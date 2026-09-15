@@ -14,7 +14,7 @@ import keyring
 from remctl import __version__
 from remctl.deploy import DeployTarget, ProgressDisplay, deploy_many
 from remctl.ssh import run_ssh, validate_ssh_credential
-from remctl.transfer import run_scp, run_scp_pull
+from remctl.transfer import run_rsync, run_rsync_pull, run_scp, run_scp_pull
 from remctl.workflow import (
     ACTIONS_PATH,
     CONFIG_DIR,
@@ -433,6 +433,103 @@ def scp_transfer(
     return 0
 
 
+def _expand_rsync_local_path(value: str) -> str:
+    """Expand a local path while preserving rsync's trailing-slash semantics."""
+    expanded = str(Path(value).expanduser())
+    if value.endswith("/") and not expanded.endswith("/"):
+        expanded += "/"
+    return expanded
+
+
+def rsync_transfer(
+    direction: str,
+    host: str,
+    source: str,
+    destination: str,
+    username: str | None = None,
+    *,
+    archive: bool = True,
+    compress: bool = False,
+    delete: bool = False,
+    excludes: Sequence[str] = (),
+    dry_run: bool = False,
+    checksum: bool = False,
+    partial: bool = False,
+    bandwidth_limit: int | None = None,
+) -> int:
+    """Push or pull a path with rsync and a stored host credential."""
+    local_value = source if direction == "push" else destination
+    local_path = Path(local_value).expanduser()
+    if direction == "push" and not local_path.exists():
+        print(f"error: local path does not exist: {local_path}", file=sys.stderr)
+        return 2
+    if direction == "pull" and not local_path.parent.is_dir():
+        print(
+            f"error: local destination directory does not exist: {local_path.parent}",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        index = load_host_index()
+        credential, exit_code = resolve_host_credential(host, index, username)
+    except (keyring.errors.KeyringError, ValueError) as error:
+        print(f"error: unable to read credential: {error}", file=sys.stderr)
+        return 1
+
+    if credential is None:
+        return exit_code
+
+    display = ProgressDisplay([host])
+    phase = "pushing" if direction == "push" else "pulling"
+    display.update(host, phase, 0, "0B/s")
+
+    def progress(percent: int, rate: str) -> None:
+        display.update(host, phase, percent, rate)
+
+    options = {
+        "archive": archive,
+        "compress": compress,
+        "delete": delete,
+        "excludes": tuple(excludes),
+        "dry_run": dry_run,
+        "checksum": checksum,
+        "partial": partial,
+        "bandwidth_limit": bandwidth_limit,
+    }
+    if direction == "push":
+        exit_code, transcript = run_rsync(
+            _expand_rsync_local_path(source),
+            host,
+            credential.username,
+            credential.password,
+            destination,
+            progress,
+            **options,
+        )
+    else:
+        exit_code, transcript = run_rsync_pull(
+            host,
+            credential.username,
+            credential.password,
+            source,
+            _expand_rsync_local_path(destination),
+            progress,
+            **options,
+        )
+
+    if exit_code != 0:
+        display.update(host, "transfer failed")
+        print(f"error: rsync {direction} failed for {host}", file=sys.stderr)
+        for line in transcript.strip().splitlines():
+            print(f"[{host}] {line}", file=sys.stderr)
+        return exit_code
+
+    display.update(host, "completed", 100)
+    print(f"[{host}] synchronized {source} to {destination}")
+    return 0
+
+
 def get_host(host: str, username: str | None = None) -> int:
     """Show credentials stored for a host without revealing passwords."""
     try:
@@ -625,6 +722,75 @@ def uninstall_remctl() -> int:
     return 0
 
 
+def _positive_integer(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _add_rsync_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("-u", "--user", help="username to use")
+    parser.add_argument(
+        "--archive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="preserve metadata and copy recursively (default: enabled)",
+    )
+    parser.add_argument(
+        "-z", "--compress", action="store_true", help="compress transferred data"
+    )
+    parser.add_argument(
+        "--delete",
+        action="store_true",
+        help="delete destination files absent from the source",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="exclude a pattern; may be supplied more than once",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="show changes without applying them"
+    )
+    parser.add_argument(
+        "--checksum",
+        action="store_true",
+        help="compare file checksums instead of size and modification time",
+    )
+    parser.add_argument(
+        "--partial",
+        action="store_true",
+        help="keep partially transferred files for resuming",
+    )
+    parser.add_argument(
+        "--bwlimit",
+        type=_positive_integer,
+        metavar="KBPS",
+        help="limit transfer bandwidth in KiB per second",
+    )
+
+
+def _handle_rsync_arguments(args: argparse.Namespace, direction: str) -> int:
+    return rsync_transfer(
+        direction,
+        args.host,
+        args.source,
+        args.destination,
+        args.user,
+        archive=args.archive,
+        compress=args.compress,
+        delete=args.delete,
+        excludes=args.exclude,
+        dry_run=args.dry_run,
+        checksum=args.checksum,
+        partial=args.partial,
+        bandwidth_limit=args.bwlimit,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
     parser = argparse.ArgumentParser(
@@ -759,6 +925,36 @@ def build_parser() -> argparse.ArgumentParser:
             args.user,
             recursive=args.recursive,
         )
+    )
+
+    rsync_parser = subparsers.add_parser(
+        "rsync",
+        help="synchronize files over SSH with a saved credential",
+    )
+    rsync_subparsers = rsync_parser.add_subparsers(
+        dest="rsync_command", required=True
+    )
+
+    rsync_push_parser = rsync_subparsers.add_parser(
+        "push", help="synchronize a local path to a remote host"
+    )
+    _add_rsync_options(rsync_push_parser)
+    rsync_push_parser.add_argument("source", help="local source path")
+    rsync_push_parser.add_argument("host", help="remote hostname or IP address")
+    rsync_push_parser.add_argument("destination", help="remote destination path")
+    rsync_push_parser.set_defaults(
+        handler=lambda args: _handle_rsync_arguments(args, "push")
+    )
+
+    rsync_pull_parser = rsync_subparsers.add_parser(
+        "pull", help="synchronize a remote path to the local filesystem"
+    )
+    _add_rsync_options(rsync_pull_parser)
+    rsync_pull_parser.add_argument("host", help="remote hostname or IP address")
+    rsync_pull_parser.add_argument("source", help="remote source path")
+    rsync_pull_parser.add_argument("destination", help="local destination path")
+    rsync_pull_parser.set_defaults(
+        handler=lambda args: _handle_rsync_arguments(args, "pull")
     )
 
     delete_parser = subparsers.add_parser(

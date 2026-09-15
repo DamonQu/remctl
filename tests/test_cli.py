@@ -692,6 +692,66 @@ class CliTests(unittest.TestCase):
         load_host_index.assert_not_called()
         run_scp.assert_not_called()
 
+    def test_rsync_push_passes_options_and_preserves_trailing_slash(self) -> None:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "release"
+            source.mkdir()
+
+            def run_rsync(*args, **kwargs):
+                args[5](72, "4.8MB/s")
+                return 0, ""
+
+            with (
+                patch(
+                    "remctl.cli.load_host_index",
+                    return_value={"10.0.0.11": ["root"]},
+                ),
+                patch("remctl.cli.keyring.get_password", return_value="secret"),
+                patch("remctl.cli.run_rsync", side_effect=run_rsync) as rsync,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = main(
+                    [
+                        "rsync",
+                        "push",
+                        "--compress",
+                        "--delete",
+                        "--exclude",
+                        "*.tmp",
+                        "--partial",
+                        "--bwlimit",
+                        "1024",
+                        f"{source}/",
+                        "10.0.0.11",
+                        "/opt/release/",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(rsync.call_args.args[0].endswith("/"))
+        self.assertTrue(rsync.call_args.kwargs["archive"])
+        self.assertTrue(rsync.call_args.kwargs["compress"])
+        self.assertTrue(rsync.call_args.kwargs["delete"])
+        self.assertTrue(rsync.call_args.kwargs["partial"])
+        self.assertEqual(rsync.call_args.kwargs["excludes"], ("*.tmp",))
+        self.assertEqual(rsync.call_args.kwargs["bandwidth_limit"], 1024)
+        self.assertIn("72%", output.getvalue())
+
+    def test_rsync_rejects_nonpositive_bandwidth_limit(self) -> None:
+        with self.assertRaises(SystemExit):
+            main(
+                [
+                    "rsync",
+                    "push",
+                    "--bwlimit",
+                    "0",
+                    "source",
+                    "10.0.0.11",
+                    "/tmp/",
+                ]
+            )
+
     def test_reindex_removes_missing_credentials(self) -> None:
         output = io.StringIO()
 

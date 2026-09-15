@@ -10,15 +10,15 @@ multi-host deployment operations. The installed command is `rctl`.
 - Validate credentials with a real SSH login before saving them.
 - Open interactive SSH sessions and execute remote commands.
 - Push and pull files or directories with SCP progress reporting.
+- Synchronize files in either direction with rsync over SSH.
 - Upload files concurrently and run configurable post-transfer workflows.
 - Keep passwords out of project files, process arguments, and shell history.
-
-Standalone rsync support is not currently implemented.
 
 ## Requirements
 
 - Python 3.10 or newer.
 - OpenSSH clients `ssh`, `scp`, and `ssh-keygen` available on `PATH`.
+- `rsync` installed locally and remotely when using `rctl rsync`.
 - A working Python `keyring` backend. On macOS, `keyring` uses Keychain.
 - Permission to execute every command referenced by a deployment workflow.
 
@@ -271,6 +271,45 @@ Both directions report percentage and bandwidth:
 ```
 
 SCP uses the same credential and host-key verification behavior as SSH.
+
+### Rsync synchronization
+
+Synchronize a local path to a remote host, or pull a remote path locally:
+
+```sh
+rctl rsync push ./release/ 10.0.0.11 /opt/release/
+rctl rsync pull 10.0.0.11 /var/log/hcdadmin/ ./logs/
+```
+
+Archive mode is enabled by default, so directories are copied recursively and
+metadata is preserved. Disable it with `--no-archive`. Common synchronization
+options are available on both `push` and `pull`:
+
+| Option | Behavior |
+| --- | --- |
+| `--archive` / `--no-archive` | Enable or disable archive mode. |
+| `-z`, `--compress` | Compress data during transfer. |
+| `--delete` | Delete destination files that are absent from the source. |
+| `--exclude PATTERN` | Exclude a pattern; repeat the option for more patterns. |
+| `--dry-run` | Show intended changes without modifying the destination. |
+| `--checksum` | Compare file contents by checksum. |
+| `--partial` | Retain partial files so interrupted transfers can resume. |
+| `--bwlimit KBPS` | Limit bandwidth in KiB per second. |
+| `-u`, `--user USER` | Select a saved account. |
+
+For example, preview a compressed mirror while excluding temporary files:
+
+```sh
+rctl rsync push --dry-run --compress --delete \
+  --exclude '*.tmp' --exclude '.git/' \
+  ./release/ 10.0.0.11 /opt/release/
+```
+
+`--delete` can remove files from the destination; use `--dry-run` first. Rsync
+also gives a trailing slash special meaning: `release/` synchronizes the
+directory contents, while `release` synchronizes the directory itself. The
+saved password is supplied through the pseudo-terminal and is never added to
+the rsync process arguments.
 
 ## Deployments and post-workflows
 

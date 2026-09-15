@@ -4,10 +4,88 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from remctl.transfer import run_scp, run_scp_pull
+from remctl.transfer import run_rsync, run_rsync_pull, run_scp, run_scp_pull
 
 
 class TransferTests(unittest.TestCase):
+    def test_rsync_push_uses_ssh_options_and_selected_configuration(self) -> None:
+        child = MagicMock()
+        child.expect.side_effect = [0, 2, 4]
+        child.match.group.side_effect = ["45", "8.4MB/s"]
+        child.exitstatus = 0
+        child.signalstatus = None
+        progress = MagicMock()
+
+        with patch("remctl.transfer.pexpect.spawn", return_value=child) as spawn:
+            exit_code, _ = run_rsync(
+                "release/",
+                "10.0.0.11",
+                "root",
+                "secret",
+                "/opt/my release/",
+                progress,
+                compress=True,
+                delete=True,
+                excludes=("*.tmp", "cache/"),
+                checksum=True,
+                partial=True,
+                bandwidth_limit=2048,
+            )
+
+        self.assertEqual(exit_code, 0)
+        command, arguments = spawn.call_args.args
+        self.assertEqual(command, "rsync")
+        self.assertNotIn("secret", arguments)
+        self.assertIn("--archive", arguments)
+        self.assertIn("--compress", arguments)
+        self.assertIn("--delete", arguments)
+        self.assertIn("--checksum", arguments)
+        self.assertIn("--partial", arguments)
+        self.assertIn("--bwlimit=2048", arguments)
+        self.assertEqual(arguments.count("--exclude"), 2)
+        self.assertIn("root@10.0.0.11:'/opt/my release/'", arguments)
+        child.sendline.assert_called_once_with("secret")
+        progress.assert_called_once_with(45, "8.4MB/s")
+
+    def test_rsync_pull_places_remote_source_before_local_destination(self) -> None:
+        child = MagicMock()
+        child.expect.side_effect = [0, 4]
+        child.exitstatus = 0
+        child.signalstatus = None
+
+        with patch("remctl.transfer.pexpect.spawn", return_value=child) as spawn:
+            exit_code, _ = run_rsync_pull(
+                "10.0.0.11",
+                "root",
+                "secret",
+                "~/logs/",
+                "logs/",
+                MagicMock(),
+                archive=False,
+                dry_run=True,
+            )
+
+        self.assertEqual(exit_code, 0)
+        arguments = spawn.call_args.args[1]
+        self.assertNotIn("--archive", arguments)
+        self.assertIn("--dry-run", arguments)
+        self.assertEqual(arguments[-2], "root@10.0.0.11:~/logs/")
+        self.assertEqual(arguments[-1], "logs/")
+
+    def test_missing_rsync_binary_returns_clean_error(self) -> None:
+        with patch("remctl.transfer.pexpect.spawn", side_effect=OSError("missing")):
+            exit_code, message = run_rsync(
+                "file.bin",
+                "10.0.0.11",
+                "root",
+                "secret",
+                "/tmp/file.bin",
+                MagicMock(),
+            )
+
+        self.assertEqual(exit_code, 255)
+        self.assertIn("unable to run rsync", message)
+
     def test_scp_reports_progress_and_keeps_password_out_of_arguments(self) -> None:
         child = MagicMock()
         child.expect.side_effect = [0, 2, 4]
