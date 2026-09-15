@@ -10,7 +10,8 @@ from unittest.mock import patch
 import keyring
 
 from remctl.cli import HostCredential, main
-from remctl.deploy import DeployOperation, DeployResult
+from remctl.deploy import DeployResult
+from remctl.workflow import WorkflowConfigError
 
 
 class CliTests(unittest.TestCase):
@@ -341,7 +342,7 @@ class CliTests(unittest.TestCase):
             patch("remctl.cli.deploy_many") as deploy_many,
             contextlib.redirect_stderr(error),
         ):
-            exit_code = main(["deploy", "-f", "missing.bin", "10.0.0.11"])
+            exit_code = main(["deploy", "missing.bin", "10.0.0.11"])
 
         self.assertEqual(exit_code, 2)
         load_host_index.assert_not_called()
@@ -350,6 +351,7 @@ class CliTests(unittest.TestCase):
 
     def test_deploy_preflights_credentials_and_runs_multiple_hosts(self) -> None:
         output = io.StringIO()
+        selected_workflow = object()
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "archon.jar"
             artifact.write_bytes(b"jar")
@@ -362,6 +364,11 @@ class CliTests(unittest.TestCase):
                     },
                 ),
                 patch("remctl.cli.keyring.get_password", return_value="secret"),
+                patch("remctl.cli.load_actions", return_value={}),
+                patch(
+                    "remctl.cli.load_workflow",
+                    return_value=selected_workflow,
+                ) as load_workflow,
                 patch(
                     "remctl.cli.deploy_many",
                     return_value=[
@@ -374,21 +381,23 @@ class CliTests(unittest.TestCase):
                 exit_code = main(
                     [
                         "deploy",
+                        "--post-workflow",
+                        "deploy-archon",
                         str(artifact),
                         "10.0.0.11",
                         "10.0.0.12",
-                        "-a",
                     ]
                 )
 
         self.assertEqual(exit_code, 0)
-        local_path, targets, operation = deploy_many.call_args.args
+        local_path, targets, resolved_workflow = deploy_many.call_args.args
         self.assertEqual(local_path.name, "archon.jar")
         self.assertEqual(
             [target.host for target in targets],
             ["10.0.0.11", "10.0.0.12"],
         )
-        self.assertIs(operation, DeployOperation.ARCHON)
+        self.assertIs(resolved_workflow, selected_workflow)
+        load_workflow.assert_called_once_with("deploy-archon", {})
         self.assertIn("[10.0.0.11] OK", output.getvalue())
 
     def test_deploy_aborts_before_transfer_when_credential_is_missing(self) -> None:
@@ -401,13 +410,57 @@ class CliTests(unittest.TestCase):
                 patch("remctl.cli.deploy_many") as deploy_many,
                 contextlib.redirect_stderr(error),
             ):
-                exit_code = main(
-                    ["deploy", "-i", str(artifact), "10.0.0.11"]
-                )
+                exit_code = main(["deploy", str(artifact), "10.0.0.11"])
 
         self.assertEqual(exit_code, 1)
         deploy_many.assert_not_called()
         self.assertIn("no credential found", error.getvalue())
+
+    def test_deploy_rejects_invalid_workflow_before_reading_credentials(self) -> None:
+        error = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "image.tar"
+            artifact.write_bytes(b"image")
+            with (
+                patch("remctl.cli.load_actions", return_value={}),
+                patch(
+                    "remctl.cli.load_workflow",
+                    side_effect=WorkflowConfigError("workflow not found: missing"),
+                ),
+                patch("remctl.cli.load_host_index") as load_host_index,
+                patch("remctl.cli.deploy_many") as deploy_many,
+                contextlib.redirect_stderr(error),
+            ):
+                exit_code = main(
+                    [
+                        "deploy",
+                        "--post-workflow",
+                        "missing",
+                        str(artifact),
+                        "10.0.0.11",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        load_host_index.assert_not_called()
+        deploy_many.assert_not_called()
+        self.assertIn("unable to load post-workflow", error.getvalue())
+
+    def test_deploy_rejects_removed_operation_flags(self) -> None:
+        with self.assertRaises(SystemExit):
+            main(["deploy", "-i", "image.tar", "10.0.0.11"])
+
+    def test_deploy_rejects_post_work_flow_alias(self) -> None:
+        with self.assertRaises(SystemExit):
+            main(
+                [
+                    "deploy",
+                    "--post-work-flow",
+                    "example",
+                    "image.tar",
+                    "10.0.0.11",
+                ]
+            )
 
     def test_scp_push_transfers_to_requested_remote_path_with_progress(self) -> None:
         output = io.StringIO()

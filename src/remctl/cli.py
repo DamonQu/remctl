@@ -11,9 +11,10 @@ from pathlib import Path
 import keyring
 
 from remctl import __version__
-from remctl.deploy import DeployOperation, DeployTarget, ProgressDisplay, deploy_many
+from remctl.deploy import DeployTarget, ProgressDisplay, deploy_many
 from remctl.ssh import run_ssh, validate_ssh_credential
 from remctl.transfer import run_scp, run_scp_pull
+from remctl.workflow import WorkflowConfigError, load_actions, load_workflow
 
 KEYRING_INDEX_SERVICE = "remctl:index"
 KEYRING_INDEX_ACCOUNT = "hosts"
@@ -274,7 +275,7 @@ def exec_host(
 def deploy_hosts(
     file_path: str,
     hosts: Sequence[str],
-    operation: DeployOperation,
+    workflow_name: str | None = None,
     username: str | None = None,
 ) -> int:
     """Validate deployment inputs and deploy to all requested hosts."""
@@ -282,6 +283,14 @@ def deploy_hosts(
     if not local_path.is_file():
         print(f"error: file does not exist: {local_path}", file=sys.stderr)
         return 2
+
+    workflow = None
+    if workflow_name is not None:
+        try:
+            workflow = load_workflow(workflow_name, load_actions())
+        except WorkflowConfigError as error:
+            print(f"error: unable to load post-workflow: {error}", file=sys.stderr)
+            return 2
 
     unique_hosts = list(dict.fromkeys(hosts))
     targets: list[DeployTarget] = []
@@ -319,7 +328,7 @@ def deploy_hosts(
         print(f"error: unable to read credential: {error}", file=sys.stderr)
         return 1
 
-    results = deploy_many(local_path, targets, operation)
+    results = deploy_many(local_path, targets, workflow)
     failed = False
     print("\nDeployment results:")
     for result in results:
@@ -601,38 +610,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="transfer and deploy a file to one or more hosts",
     )
     deploy_parser.add_argument("-u", "--user", help="username to use on all hosts")
-    operation_group = deploy_parser.add_mutually_exclusive_group(required=True)
-    operation_group.add_argument(
-        "-i",
-        "--image",
-        dest="operation",
-        action="store_const",
-        const=DeployOperation.IMAGE,
-        help="load a Docker image archive",
-    )
-    operation_group.add_argument(
-        "-a",
-        "--archon",
-        dest="operation",
-        action="store_const",
-        const=DeployOperation.ARCHON,
-        help="deploy the Archon jar and restart hcdadmin",
-    )
-    operation_group.add_argument(
-        "-m",
-        "--hcdmgmt",
-        dest="operation",
-        action="store_const",
-        const=DeployOperation.HCDMGMT,
-        help="deploy the hcdmgmt jar and restart hcdmgmt",
-    )
-    operation_group.add_argument(
-        "-f",
-        "--file-only",
-        dest="operation",
-        action="store_const",
-        const=DeployOperation.FILE,
-        help="only upload the file and print its remote temporary path",
+    deploy_parser.add_argument(
+        "--post-workflow",
+        help="workflow to run after a successful transfer",
     )
     deploy_parser.add_argument("file", help="local file to transfer")
     deploy_parser.add_argument("hosts", nargs="+", help="target hosts")
@@ -640,7 +620,7 @@ def build_parser() -> argparse.ArgumentParser:
         handler=lambda args: deploy_hosts(
             args.file,
             args.hosts,
-            args.operation,
+            args.post_workflow,
             args.user,
         )
     )

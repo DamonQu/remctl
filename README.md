@@ -1,35 +1,71 @@
 # remctl
 
-`remctl` is a Python package for managing remote host credentials through the
-operating system Keychain/Keyring and providing unified SSH, SCP, and rsync
-operations. Its command-line program is `rctl`.
+`remctl` is a Python command-line tool for storing remote-host credentials in
+the operating system Keychain/Keyring and using them for SSH, SCP, and
+multi-host deployment operations. The installed command is `rctl`.
 
 ## Features
 
-- Save multiple username/password credentials for the same remote host.
-- Query a stored host without revealing its password.
-- List all hosts managed by `remctl` without revealing passwords.
-- Delete a host's credentials from the system credential store.
+- Store multiple username/password credentials for one host.
 - Validate credentials with a real SSH login before saving them.
-- Open interactive SSH sessions with saved credentials.
-- Push and pull files with SCP, including live progress and bandwidth.
-- Deploy files and service artifacts to multiple hosts concurrently.
-- Use macOS Keychain through Python's `keyring` package.
-- Keep passwords out of project files and shell command history.
+- Open interactive SSH sessions and execute remote commands.
+- Push and pull files or directories with SCP progress reporting.
+- Upload files concurrently and run configurable post-transfer workflows.
+- Keep passwords out of project files, process arguments, and shell history.
 
-Standalone rsync commands will be added in a later version.
+Standalone rsync support is not currently implemented.
 
-## Add a host
+## Requirements
 
-Activate the virtual environment, then save credentials for a hostname or IP
-address:
+- Python 3.10 or newer.
+- OpenSSH clients `ssh`, `scp`, and `ssh-keygen` available on `PATH`.
+- A working Python `keyring` backend. On macOS, `keyring` uses Keychain.
+- Permission to execute every command referenced by a deployment workflow.
+
+## Installation
+
+Install a built wheel:
 
 ```sh
+python3 -m pip install remctl-0.1.0-py3-none-any.whl
+```
+
+Confirm that the command is available:
+
+```sh
+rctl --version
+```
+
+For development, install the source tree in editable mode:
+
+```sh
+python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --editable .
+```
+
+## Quick start
+
+Save and validate a credential, connect to the host, and upload a file:
+
+```sh
+rctl add server.example.com
+rctl ssh server.example.com
+rctl scp push ./artifact.jar server.example.com /tmp/artifact.jar
+```
+
+The first connection may show an OpenSSH host fingerprint. Verify it through a
+trusted channel before accepting it.
+
+## Credential management
+
+### Add credentials
+
+```sh
 rctl add server.example.com
 ```
 
-The command prompts interactively:
+The command prompts for a username and hidden password:
 
 ```text
 username: alice
@@ -37,195 +73,26 @@ password:
 Credential saved for alice@server.example.com
 ```
 
-The password input is hidden. Each host uses the Keychain/Keyring service name
-`remctl:<host>`, with the username as its account and the password as its secret.
-Run `rctl add` again with another username to add a credential without
-overwriting the existing account.
-
-Before saving, `rctl add` opens an authentication-only OpenSSH connection. It
-does not start a remote shell or execute a remote command. A failed login is not
-stored. On a first connection, review and confirm the host fingerprint shown by
-OpenSSH.
-
-Credential validation is quiet by default: only the final success or failure is
-shown. Enable OpenSSH diagnostics when troubleshooting:
+Before saving, `rctl add` opens an authentication-only SSH connection. It does
+not start a shell or execute a remote command, and a failed login is not stored.
+Validation output is quiet by default. Enable OpenSSH diagnostics when needed:
 
 ```sh
 rctl add server.example.com --debug
 ```
 
-## Open an SSH session
+Credentials use the Keyring service `remctl:<host>`, with the username as the
+account and the password as the secret. Running `add` with another username
+adds another account without overwriting existing accounts for that host.
 
-Connect using the only credential stored for a host:
-
-```sh
-rctl ssh 10.0.0.11
-```
-
-If the host has multiple accounts, select one explicitly:
-
-```sh
-rctl ssh 10.0.0.11 --user root
-```
-
-The password is read from Keychain/Keyring and sent directly to the OpenSSH
-pseudo-terminal. It is never added to process arguments or printed.
-
-If OpenSSH reports that the host key has changed, `rctl` asks before running
-`ssh-keygen -R <host>` to remove the stale entry from `~/.ssh/known_hosts`. It
-then retries and lets OpenSSH display the new fingerprint for confirmation.
-Never approve a changed key until its new fingerprint has been verified through
-a trusted channel.
-
-## Execute a remote command
-
-Run a command with the only credential stored for a host:
-
-```sh
-rctl exec 10.0.0.11 uname -a
-```
-
-Quote commands that contain remote shell operators so the local shell does not
-interpret them first:
-
-```sh
-rctl exec 10.0.0.11 'uptime && df -h'
-```
-
-Remote stdout and stderr are printed directly, and `rctl` exits with the SSH
-process exit code. For a host with multiple accounts, put `--user` before the
-host:
-
-```sh
-rctl exec --user root 10.0.0.11 systemctl status sshd
-```
-
-Use `--` when the remote command itself begins with an option:
-
-```sh
-rctl exec 10.0.0.11 -- -example-command
-```
-
-The command is passed as arguments to OpenSSH; the saved password is never
-included in the process arguments.
-
-## Transfer files with SCP
-
-Upload a local file to a specific remote path:
-
-```sh
-rctl scp push ./artifact.jar 10.0.0.11 /tmp/artifact.jar
-```
-
-Local directories are detected automatically and uploaded recursively:
-
-```sh
-rctl scp push ./release 10.0.0.11 /opt/releases/
-```
-
-Download a remote file to a local path:
-
-```sh
-rctl scp pull 10.0.0.11 /var/log/hcdadmin.log ./hcdadmin.log
-```
-
-Download a remote directory recursively:
-
-```sh
-rctl scp pull --recursive 10.0.0.11 /var/log/hcdadmin ./logs
-```
-
-For a host with multiple credentials, select one explicitly:
-
-```sh
-rctl scp push --user root ./artifact.jar 10.0.0.11 /tmp/
-rctl scp pull --user root 10.0.0.11 /tmp/result.txt ./result.txt
-```
-
-Both directions display continuously updated transfer percentage and bandwidth:
-
-```text
-[10.0.0.11] pushing  67% 9.2MB/s
-[10.0.0.11] completed 100%
-```
-
-SCP uses the same Keychain credential and host-key verification behavior as
-`rctl ssh`. Passwords are sent through the pseudo-terminal and never placed in
-the SCP process arguments.
-
-## Deploy files and artifacts
-
-`rctl deploy` checks that the local file and all target credentials exist before
-starting. Targets run concurrently, while the terminal displays each host's
-current step, transfer percentage, and bandwidth.
-
-Upload and load a Docker image archive, then remove the temporary archive:
-
-```sh
-rctl deploy -i image.tar 10.0.0.11 10.0.0.12
-```
-
-The result includes every `Loaded image:` or `Loaded image ID:` reference
-reported by `docker image load --input`.
-
-Deploy the Archon jar and restart `hcdadmin`:
-
-```sh
-rctl deploy -a archon.jar 10.0.0.11 10.0.0.12
-```
-
-The jar is copied to:
-
-```text
-/usr/share/hcdserver/hcdadmin/archon-1.0-SNAPSHOT-jar-with-dependencies.jar
-```
-
-Deploy the hcdmgmt jar and restart `hcdmgmt`:
-
-```sh
-rctl deploy -m hcdmgmt.jar 10.0.0.11 10.0.0.12
-```
-
-The jar is copied to:
-
-```text
-/usr/share/hcdserver/hcdmgmt/hcdmgmt-1.0-SNAPSHOT.jar
-```
-
-Only upload a file and retain it in the generated remote temporary path:
-
-```sh
-rctl deploy -f support-bundle.tar.gz 10.0.0.11 10.0.0.12
-```
-
-For hosts with multiple credentials, select the same username on all targets:
-
-```sh
-rctl deploy --user root -a archon.jar 10.0.0.11 10.0.0.12
-```
-
-Operation flags are mutually exclusive:
-
-- `-i`, `--image`: load a Docker image archive.
-- `-a`, `--archon`: install the Archon jar and restart `hcdadmin`.
-- `-m`, `--hcdmgmt`: install the hcdmgmt jar and restart `hcdmgmt`.
-- `-f`, `--file-only`: upload only and print the temporary path.
-
-Docker and jar deployments clean up the remote temporary file. File-only mode
-keeps it. Deployment commands require the selected remote account to have
-permission to run `docker`, copy into `/usr/share/hcdserver`, and restart the
-relevant systemd service.
-
-## Query a host
-
-Check whether credentials exist and show the stored username:
+### Query credentials
 
 ```sh
 rctl get server.example.com
 rctl get server.example.com alice
 ```
 
-Example output:
+Without a username, all indexed accounts for the host are shown:
 
 ```text
 host: server.example.com
@@ -233,18 +100,16 @@ username: alice
 password: stored
 ```
 
-Without a username, every account saved for that host is shown. Pass a username
-to query one account. For security, `rctl get` never prints stored passwords.
+Stored passwords are never printed.
 
-## List hosts
-
-List every credential tracked by `remctl`:
+### List credentials
 
 ```sh
 rctl list
+rctl ls
 ```
 
-Example output:
+Example:
 
 ```text
 HOST                USERNAME
@@ -253,51 +118,218 @@ server.example.com  alice
 server.example.com  root
 ```
 
-The `ls` alias is also available. Passwords are never included in list output.
-The host index is stored in Keychain/Keyring under the `remctl:index` service,
-not in a plaintext project file.
+The host index is stored in Keyring under the `remctl:index` service rather
+than in a plaintext project file.
 
-Check the index against Keychain/Keyring and remove stale entries:
+### Repair the credential index
 
 ```sh
 rctl reindex
 ```
 
-An invalid index is reset. An index entry whose password no longer exists is
-removed, and an empty invalid credential is deleted. Credential and index
-updates use repairable ordering and best-effort rollback to prevent new
-inconsistencies.
-Because the cross-platform `keyring` API cannot enumerate arbitrary entries,
-`reindex` cannot discover credentials that were created outside the index.
+`reindex` removes entries whose password no longer exists, deletes empty
+credentials, and resets an invalid or obsolete index. The cross-platform
+`keyring` API cannot enumerate arbitrary entries, so credentials created
+outside the index cannot be discovered automatically.
 
-Credentials created by an earlier development version used a different storage
-layout and cannot be discovered automatically. Run `rctl reindex` once to reset
-the obsolete index, then run `rctl add <host>` again for each account.
+### Delete credentials
 
-## Delete a host
-
-Remove a host's credentials from Keychain/Keyring:
+Delete one account:
 
 ```sh
 rctl delete server.example.com alice
 ```
 
-`remove`, `rm`, and `del` are also accepted as aliases:
-
-```sh
-rctl rm server.example.com
-```
-
-If a host has only one account, the username may be omitted. If it has multiple
-accounts, specify one username or explicitly delete all accounts:
+If the host has one account, the username may be omitted. For a host with
+multiple accounts, provide a username or delete every account explicitly:
 
 ```sh
 rctl delete server.example.com --all
 ```
 
+`remove`, `rm`, and `del` are aliases for `delete`.
+
+## Remote operations
+
+### Interactive SSH
+
+Use the only stored account:
+
+```sh
+rctl ssh 10.0.0.11
+```
+
+Select an account when a host has multiple credentials:
+
+```sh
+rctl ssh 10.0.0.11 --user root
+```
+
+The saved password is sent through the OpenSSH pseudo-terminal. It is not
+included in process arguments or printed.
+
+If a stored host key has changed, `rctl` asks before running
+`ssh-keygen -R <host>`. After removal, OpenSSH shows the new fingerprint for
+confirmation. Do not approve a changed key until it has been verified through a
+trusted channel.
+
+### Remote commands
+
+```sh
+rctl exec 10.0.0.11 uname -a
+rctl exec --user root 10.0.0.11 systemctl status sshd
+```
+
+Quote commands containing remote shell operators so the local shell does not
+interpret them:
+
+```sh
+rctl exec 10.0.0.11 'uptime && df -h'
+```
+
+Use `--` if the remote command begins with an option:
+
+```sh
+rctl exec 10.0.0.11 -- -example-command
+```
+
+Remote output is written directly to the terminal, and `rctl` returns the SSH
+process exit code.
+
+### SCP transfers
+
+Upload a file or directory:
+
+```sh
+rctl scp push ./artifact.jar 10.0.0.11 /tmp/artifact.jar
+rctl scp push ./release 10.0.0.11 /opt/releases/
+```
+
+Local directories are detected automatically and transferred recursively.
+
+Download a file or directory:
+
+```sh
+rctl scp pull 10.0.0.11 /var/log/hcdadmin.log ./hcdadmin.log
+rctl scp pull --recursive 10.0.0.11 /var/log/hcdadmin ./logs
+```
+
+Select a stored account with `--user`:
+
+```sh
+rctl scp push --user root ./artifact.jar 10.0.0.11 /tmp/
+rctl scp pull --user root 10.0.0.11 /tmp/result.txt ./result.txt
+```
+
+Both directions report percentage and bandwidth:
+
+```text
+[10.0.0.11] pushing  67% 9.2MB/s
+[10.0.0.11] completed 100%
+```
+
+SCP uses the same credential and host-key verification behavior as SSH.
+
+## Deployments and post-workflows
+
+`rctl deploy` validates the local file, selected workflow, and all target
+credentials before transferring anything. Targets run concurrently; actions
+within one target run sequentially.
+
+Upload a file without running a workflow:
+
+```sh
+rctl deploy support-bundle.tar.gz 10.0.0.11 10.0.0.12
+```
+
+The generated remote temporary path is retained and printed.
+
+Run a named workflow after each successful upload:
+
+```sh
+rctl deploy --post-workflow deploy-archon \
+  archon.jar 10.0.0.11 10.0.0.12
+```
+
+Use the same named account on all targets:
+
+```sh
+rctl deploy --user root --post-workflow deploy-archon \
+  archon.jar 10.0.0.11 10.0.0.12
+```
+
+### Actions
+
+An action represents one remote operation. These built-in actions are always
+available and cannot be overridden:
+
+| Action | Parameters | Behavior |
+| --- | --- | --- |
+| `copy` | `destination` | Copy the uploaded file to a remote path. |
+| `restart-service` | `service` | Restart a systemd service. |
+| `docker-image-load` | None | Load the uploaded Docker image archive. |
+| `restart-container` | `container` | Restart a Docker container. |
+
+Define custom actions in `~/.remctl.actions.yaml`:
+
+```yaml
+version: 1
+actions:
+  extract:
+    description: Extract an uploaded archive
+    command: "tar -xf {remote_path} -C {destination}"
+```
+
+Custom commands run through the remote shell. Templates may reference these
+runtime values:
+
+- `{remote_path}`: generated remote path containing the uploaded file.
+- `{host}`: current target host.
+- `{username}`: selected remote username.
+- `{local_name}`: local file name.
+- Values declared in the workflow step's `with` mapping.
+
+All substituted values are shell-quoted. The action file contains executable
+commands and must not be writable by untrusted users.
+
+### Workflows
+
+Define workflows in `~/.remctl.workflows.yaml`:
+
+```yaml
+version: 1
+workflows:
+  deploy-archon:
+    cleanup: always
+    steps:
+      - action: copy
+        with:
+          destination: /usr/share/hcdserver/hcdadmin/archon.jar
+      - action: restart-service
+        with:
+          service: hcdadmin
+
+  load-image:
+    cleanup: success
+    steps:
+      - action: docker-image-load
+```
+
+Every workflow requires at least one step and one cleanup policy:
+
+| Policy | Behavior |
+| --- | --- |
+| `always` | Attempt cleanup after success, action failure, or transfer failure. |
+| `success` | Clean up only after every action succeeds. |
+| `never` | Always retain the uploaded temporary file. |
+
+Actions run in order and stop at the first failure. A cleanup failure marks the
+target as failed. Destinations, service names, container names, and other action
+parameters are defined in YAML and cannot be overridden from the deploy command.
+
 ## Development
 
-Create a virtual environment and install the project:
+Create and activate a virtual environment:
 
 ```sh
 python3 -m venv .venv
@@ -305,15 +337,69 @@ source .venv/bin/activate
 python -m pip install --editable .
 ```
 
-Run the command:
+Run the complete test suite:
+
+```sh
+python -m unittest discover -s tests
+```
+
+Run the package directly:
 
 ```sh
 rctl --version
 python -m remctl --version
 ```
 
-Run the tests with Python's standard library:
+## Building installation packages
+
+The project uses the PEP 517 build configuration in `pyproject.toml`. The
+`build` frontend creates both a wheel and a source distribution in an isolated
+environment.
+
+Install the build frontend:
+
+```sh
+source .venv/bin/activate
+python -m pip install build
+```
+
+Run the tests, then build both package formats:
 
 ```sh
 python -m unittest discover -s tests
+python -m build
+```
+
+For version `0.1.0`, the generated files are:
+
+```text
+dist/remctl-0.1.0-py3-none-any.whl
+dist/remctl-0.1.0.tar.gz
+```
+
+The wheel is the preferred installation artifact. The source archive contains
+the source tree, project metadata, README, and tests. The isolated build may
+download the build-system requirement declared in `pyproject.toml`.
+
+Inspect the package contents:
+
+```sh
+python -m zipfile --list dist/remctl-0.1.0-py3-none-any.whl
+tar -tzf dist/remctl-0.1.0.tar.gz
+```
+
+Calculate checksums:
+
+```sh
+shasum -a 256 dist/remctl-0.1.0-py3-none-any.whl
+shasum -a 256 dist/remctl-0.1.0.tar.gz
+```
+
+Test the wheel in a clean virtual environment before distributing it:
+
+```sh
+python3 -m venv /tmp/remctl-package-test
+/tmp/remctl-package-test/bin/python -m pip install \
+  dist/remctl-0.1.0-py3-none-any.whl
+/tmp/remctl-package-test/bin/rctl --version
 ```

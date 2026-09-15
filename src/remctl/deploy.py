@@ -7,25 +7,12 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import TextIO
 
 from remctl.ssh import run_ssh
 from remctl.transfer import run_scp
-
-ARCHON_PATH = (
-    "/usr/share/hcdserver/hcdadmin/"
-    "archon-1.0-SNAPSHOT-jar-with-dependencies.jar"
-)
-HCDMGMT_PATH = "/usr/share/hcdserver/hcdmgmt/hcdmgmt-1.0-SNAPSHOT.jar"
-
-
-class DeployOperation(str, Enum):
-    IMAGE = "image"
-    ARCHON = "archon"
-    HCDMGMT = "hcdmgmt"
-    FILE = "file"
+from remctl.workflow import CleanupPolicy, WorkflowDefinition, render_action
 
 
 @dataclass(frozen=True)
@@ -90,7 +77,7 @@ def _temporary_path(local_path: Path) -> str:
 def _run_remote_step(
     target: DeployTarget,
     label: str,
-    command: tuple[str, ...],
+    command: str,
     display: ProgressDisplay,
 ) -> tuple[int, str]:
     display.update(target.host, label)
@@ -99,7 +86,7 @@ def _run_remote_step(
         target.host,
         target.username,
         target.password,
-        remote_command=command,
+        remote_command=(command,),
         interactive=False,
         output=output,
     )
@@ -114,15 +101,36 @@ def _cleanup(
     return _run_remote_step(
         target,
         "cleaning temporary file",
-        ("rm", "-f", "--", remote_path),
+        f"rm -f -- {remote_path}",
         display,
     )
+
+
+def _cleanup_after_failure(
+    target: DeployTarget,
+    remote_path: str,
+    display: ProgressDisplay,
+    summary: str,
+    output: str,
+) -> DeployResult:
+    cleanup_code, cleanup_output = _cleanup(target, remote_path, display)
+    combined_output = output + cleanup_output
+    if cleanup_code != 0:
+        display.update(target.host, "operation and cleanup failed")
+        return DeployResult(
+            target.host,
+            False,
+            f"{summary}; temporary file cleanup failed",
+            combined_output,
+        )
+    display.update(target.host, "failed")
+    return DeployResult(target.host, False, summary, combined_output)
 
 
 def deploy_to_target(
     local_path: Path,
     target: DeployTarget,
-    operation: DeployOperation,
+    workflow: WorkflowDefinition | None,
     display: ProgressDisplay,
 ) -> DeployResult:
     """Transfer and deploy a file to one target."""
@@ -142,111 +150,79 @@ def deploy_to_target(
         ),
     )
     if exit_code != 0:
-        if operation is not DeployOperation.FILE:
-            cleanup_code, cleanup_output = _cleanup(target, remote_path, display)
-            transcript += cleanup_output
-            if cleanup_code != 0:
-                display.update(target.host, "transfer and cleanup failed")
-                return DeployResult(
-                    target.host,
-                    False,
-                    "file transfer failed; temporary file cleanup failed",
-                    transcript,
-                )
+        if workflow is not None and workflow.cleanup is CleanupPolicy.ALWAYS:
+            return _cleanup_after_failure(
+                target,
+                remote_path,
+                display,
+                "file transfer failed",
+                transcript,
+            )
         display.update(target.host, "transfer failed")
         return DeployResult(target.host, False, "file transfer failed", transcript)
 
     display.update(target.host, "transfer complete", 100)
-    if operation is DeployOperation.FILE:
+    if workflow is None:
         display.update(target.host, "completed")
         return DeployResult(target.host, True, f"uploaded to {remote_path}")
 
+    context = {
+        "remote_path": remote_path,
+        "host": target.host,
+        "username": target.username,
+        "local_name": local_path.name,
+    }
     output_parts: list[str] = []
-    if operation is DeployOperation.IMAGE:
+    for step in workflow.steps:
+        command = render_action(step, context)
         exit_code, output = _run_remote_step(
             target,
-            "loading Docker image",
-            ("docker", "image", "load", "--input", remote_path),
+            f"running {step.action.name}",
+            command,
             display,
         )
         output_parts.append(output)
-        cleanup_code, cleanup_output = _cleanup(target, remote_path, display)
-        output_parts.append(cleanup_output)
         if exit_code != 0:
-            display.update(target.host, "Docker image load failed")
+            summary = f"workflow {workflow.name} failed at {step.action.name}"
+            if workflow.cleanup is CleanupPolicy.ALWAYS:
+                return _cleanup_after_failure(
+                    target,
+                    remote_path,
+                    display,
+                    summary,
+                    "".join(output_parts),
+                )
+            display.update(target.host, f"{step.action.name} failed")
             return DeployResult(
                 target.host,
                 False,
-                "docker image load failed",
+                summary,
                 "".join(output_parts),
             )
+
+    if workflow.cleanup in {CleanupPolicy.ALWAYS, CleanupPolicy.SUCCESS}:
+        cleanup_code, cleanup_output = _cleanup(target, remote_path, display)
+        output_parts.append(cleanup_output)
         if cleanup_code != 0:
             display.update(target.host, "temporary file cleanup failed")
             return DeployResult(
                 target.host,
                 False,
-                "image loaded but temporary file cleanup failed",
+                f"workflow {workflow.name} completed but cleanup failed",
                 "".join(output_parts),
             )
-        image_refs = re.findall(r"Loaded image(?: ID)?:\s*(\S+)", output)
-        summary = "docker image loaded"
-        if image_refs:
-            summary += f": {', '.join(image_refs)}"
-    else:
-        destination = (
-            ARCHON_PATH if operation is DeployOperation.ARCHON else HCDMGMT_PATH
-        )
-        service = "hcdadmin" if operation is DeployOperation.ARCHON else "hcdmgmt"
-        exit_code, output = _run_remote_step(
-            target,
-            f"copying artifact to {destination}",
-            ("cp", "--", remote_path, destination),
-            display,
-        )
-        output_parts.append(output)
-        cleanup_code, cleanup_output = _cleanup(target, remote_path, display)
-        output_parts.append(cleanup_output)
-        if exit_code != 0:
-            display.update(target.host, "artifact copy failed")
-            return DeployResult(
-                target.host,
-                False,
-                "artifact copy failed",
-                "".join(output_parts),
-            )
-        if cleanup_code != 0:
-            display.update(target.host, "temporary file cleanup failed")
-            return DeployResult(
-                target.host,
-                False,
-                "artifact copied but temporary file cleanup failed",
-                "".join(output_parts),
-            )
-        exit_code, output = _run_remote_step(
-            target,
-            f"restarting {service}",
-            ("systemctl", "restart", service),
-            display,
-        )
-        output_parts.append(output)
-        if exit_code != 0:
-            display.update(target.host, f"{service} restart failed")
-            return DeployResult(
-                target.host,
-                False,
-                f"systemctl restart {service} failed",
-                "".join(output_parts),
-            )
-        summary = f"deployed and restarted {service}"
 
     display.update(target.host, "completed")
+    summary = f"workflow {workflow.name} completed"
+    if workflow.cleanup is CleanupPolicy.NEVER:
+        summary += f"; uploaded file retained at {remote_path}"
     return DeployResult(target.host, True, summary, "".join(output_parts))
 
 
 def deploy_many(
     local_path: Path,
     targets: list[DeployTarget],
-    operation: DeployOperation,
+    workflow: WorkflowDefinition | None,
     stream: TextIO | None = None,
 ) -> list[DeployResult]:
     """Deploy to all targets concurrently and retain input ordering."""
@@ -258,7 +234,7 @@ def deploy_many(
                 deploy_to_target,
                 local_path,
                 target,
-                operation,
+                workflow,
                 display,
             ): target.host
             for target in targets
