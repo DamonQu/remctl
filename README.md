@@ -83,6 +83,26 @@ rctl scp push ./artifact.jar server.example.com /tmp/artifact.jar
 The first connection may show an OpenSSH host fingerprint. Verify it through a
 trusted channel before accepting it.
 
+## Bash completion
+
+Enable command and option completion in the current Bash session:
+
+```sh
+source <(rctl completion bash)
+```
+
+To enable it for future interactive Bash sessions, add the same line to
+`~/.bashrc`:
+
+```sh
+printf '%s\n' 'source <(rctl completion bash)' >> ~/.bashrc
+source ~/.bashrc
+```
+
+The completion script covers commands, SCP and rsync subcommands, their
+options, and local source paths. Generating the script does not create
+`~/.remctl/` or access Keyring credentials.
+
 Commands that connect to an unregistered host do not require a separate
 `rctl add` first. `ssh`, `exec`, `scp`, and `deploy` offer to collect, validate,
 and save a missing credential before continuing:

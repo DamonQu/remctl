@@ -12,6 +12,7 @@ from pathlib import Path
 import keyring
 
 from remctl import __version__
+from remctl.completion import print_completion
 from remctl.deploy import DeployTarget, ProgressDisplay, deploy_many
 from remctl.ssh import run_ssh, validate_ssh_credential
 from remctl.transfer import run_rsync, run_rsync_pull, run_scp, run_scp_pull
@@ -982,6 +983,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="uninstall remctl and optionally delete its stored user data",
     )
     uninstall_parser.set_defaults(handler=lambda args: uninstall_remctl())
+
+    completion_parser = subparsers.add_parser(
+        "completion",
+        help="print a shell completion script",
+    )
+    completion_parser.add_argument("shell", choices=("bash",))
+    completion_parser.set_defaults(
+        handler=lambda args: print_completion(args.shell)
+    )
     return parser
 
 
@@ -992,7 +1002,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not hasattr(args, "handler"):
         parser.print_help()
         return 0
-    if args.command != "uninstall":
+    if args.command not in {"uninstall", "completion"}:
         try:
             initialize_config()
         except OSError as error:

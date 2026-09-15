@@ -55,6 +55,20 @@ class CliTests(unittest.TestCase):
         load_index.assert_not_called()
         self.assertIn("unable to initialize", error.getvalue())
 
+    def test_bash_completion_script_is_printed_without_initialization(self) -> None:
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = main(["completion", "bash"])
+
+        self.assertEqual(exit_code, 0)
+        self.initialize_config.assert_not_called()
+        script = output.getvalue()
+        self.assertIn("_rctl_completion()", script)
+        self.assertIn("scp rsync", script)
+        self.assertIn("--post-workflow", script)
+        self.assertIn("complete -o filenames -F _rctl_completion rctl", script)
+
     def test_add_host_saves_credential_in_keyring(self) -> None:
         output = io.StringIO()
 
