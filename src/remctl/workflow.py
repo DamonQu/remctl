@@ -1,5 +1,6 @@
 """Action and workflow definitions for post-transfer deployment behavior."""
 
+import os
 import re
 import shlex
 import string
@@ -10,8 +11,29 @@ from typing import Any
 
 import yaml
 
-ACTIONS_PATH = Path.home() / ".remctl.actions.yaml"
-WORKFLOWS_PATH = Path.home() / ".remctl.workflows.yaml"
+CONFIG_DIR = Path.home() / ".remctl"
+ACTIONS_PATH = CONFIG_DIR / "actions.yaml"
+WORKFLOWS_PATH = CONFIG_DIR / "workflows.yaml"
+DEFAULT_ACTIONS_CONFIG = """\
+version: 1
+actions:
+  copy:
+    builtin: true
+  restart-service:
+    builtin: true
+  docker-image-load:
+    builtin: true
+  restart-container:
+    builtin: true
+"""
+DEFAULT_WORKFLOWS_CONFIG = """\
+version: 1
+workflows:
+  load-image:
+    cleanup: always
+    steps:
+      - action: docker-image-load
+"""
 RUNTIME_PARAMETERS = frozenset({"remote_path", "host", "username", "local_name"})
 _NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 _PARAMETER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -76,6 +98,37 @@ BUILTIN_ACTIONS = {
         ),
     )
 }
+
+
+def _create_default_file(path: Path, content: str) -> bool:
+    """Create one private configuration file without replacing existing data."""
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+    except BaseException:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def initialize_config(config_dir: Path = CONFIG_DIR) -> tuple[Path, ...]:
+    """Create the user configuration directory and missing default files."""
+    config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    defaults = (
+        (config_dir / "actions.yaml", DEFAULT_ACTIONS_CONFIG),
+        (config_dir / "workflows.yaml", DEFAULT_WORKFLOWS_CONFIG),
+    )
+    return tuple(
+        path for path, content in defaults if _create_default_file(path, content)
+    )
 
 
 def _template_parameters(command: str) -> frozenset[str]:
@@ -154,6 +207,8 @@ def load_actions(path: Path = ACTIONS_PATH) -> dict[str, ActionDefinition]:
     for raw_name, raw_definition in raw_actions.items():
         name = _validate_name(raw_name, "action")
         if name in BUILTIN_ACTIONS:
+            if raw_definition == {"builtin": True}:
+                continue
             raise WorkflowConfigError(f"custom action cannot override built-in: {name}")
         if not isinstance(raw_definition, dict):
             raise WorkflowConfigError(f"action {name} must be a mapping")

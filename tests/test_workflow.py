@@ -5,9 +5,13 @@ import unittest
 from pathlib import Path
 
 from remctl.workflow import (
+    ACTIONS_PATH,
     BUILTIN_ACTIONS,
+    CONFIG_DIR,
+    WORKFLOWS_PATH,
     WorkflowConfigError,
     WorkflowStep,
+    initialize_config,
     load_actions,
     load_workflow,
     render_action,
@@ -15,10 +19,55 @@ from remctl.workflow import (
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_default_configuration_files_share_remctl_directory(self) -> None:
+        self.assertEqual(CONFIG_DIR.name, ".remctl")
+        self.assertEqual(ACTIONS_PATH, CONFIG_DIR / "actions.yaml")
+        self.assertEqual(WORKFLOWS_PATH, CONFIG_DIR / "workflows.yaml")
+
     def write_config(self, directory: str, name: str, content: str) -> Path:
         path = Path(directory) / name
         path.write_text(content, encoding="utf-8")
         return path
+
+    def test_initialization_creates_private_load_image_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = Path(directory) / ".remctl"
+
+            created = initialize_config(config_dir)
+
+            action_path = config_dir / "actions.yaml"
+            workflow_path = config_dir / "workflows.yaml"
+            self.assertEqual(created, (action_path, workflow_path))
+            self.assertEqual(config_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(action_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(workflow_path.stat().st_mode & 0o777, 0o600)
+            actions = load_actions(action_path)
+            workflow = load_workflow("load-image", actions, workflow_path)
+
+        self.assertEqual(set(actions), set(BUILTIN_ACTIONS))
+        self.assertEqual(workflow.cleanup.value, "always")
+        self.assertEqual(workflow.steps[0].action.name, "docker-image-load")
+
+    def test_initialization_does_not_replace_existing_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = Path(directory) / ".remctl"
+            config_dir.mkdir()
+            action_path = config_dir / "actions.yaml"
+            workflow_path = config_dir / "workflows.yaml"
+            original_actions = "version: 1\nactions: {}\n"
+            original_workflows = "version: 1\nworkflows: {}\n"
+            action_path.write_text(original_actions, encoding="utf-8")
+            workflow_path.write_text(original_workflows, encoding="utf-8")
+
+            created = initialize_config(config_dir)
+
+            self.assertEqual(created, ())
+            self.assertEqual(
+                action_path.read_text(encoding="utf-8"), original_actions
+            )
+            self.assertEqual(
+                workflow_path.read_text(encoding="utf-8"), original_workflows
+            )
 
     def test_missing_action_file_uses_builtins(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

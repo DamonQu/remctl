@@ -3,6 +3,7 @@
 import argparse
 import getpass
 import json
+import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -14,7 +15,15 @@ from remctl import __version__
 from remctl.deploy import DeployTarget, ProgressDisplay, deploy_many
 from remctl.ssh import run_ssh, validate_ssh_credential
 from remctl.transfer import run_scp, run_scp_pull
-from remctl.workflow import WorkflowConfigError, load_actions, load_workflow
+from remctl.workflow import (
+    ACTIONS_PATH,
+    CONFIG_DIR,
+    WORKFLOWS_PATH,
+    WorkflowConfigError,
+    initialize_config,
+    load_actions,
+    load_workflow,
+)
 
 KEYRING_INDEX_SERVICE = "remctl:index"
 KEYRING_INDEX_ACCOUNT = "hosts"
@@ -532,6 +541,95 @@ def delete_host(
     return 0
 
 
+def _confirm(prompt: str) -> bool | None:
+    """Return confirmation, or ``None`` when prompting was interrupted."""
+    try:
+        return input(prompt).strip().lower() in {"y", "yes"}
+    except (EOFError, KeyboardInterrupt):
+        print("\nOperation cancelled.", file=sys.stderr)
+        return None
+
+
+def purge_remctl_data() -> int:
+    """Delete indexed credentials and remctl YAML configuration files."""
+    deleted_credentials = 0
+    try:
+        index = load_host_index()
+        for host, usernames in index.items():
+            for username in usernames:
+                service = credential_service(host)
+                if keyring.get_password(service, username) is not None:
+                    keyring.delete_password(service, username)
+                    deleted_credentials += 1
+
+        if keyring.get_password(
+            KEYRING_INDEX_SERVICE,
+            KEYRING_INDEX_ACCOUNT,
+        ) is not None:
+            keyring.delete_password(
+                KEYRING_INDEX_SERVICE,
+                KEYRING_INDEX_ACCOUNT,
+            )
+    except (keyring.errors.KeyringError, ValueError) as error:
+        print(f"error: unable to delete Keyring data: {error}", file=sys.stderr)
+        return 1
+
+    deleted_files = 0
+    try:
+        for path in (ACTIONS_PATH, WORKFLOWS_PATH):
+            if path.exists():
+                path.unlink()
+                deleted_files += 1
+        try:
+            CONFIG_DIR.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Preserve the directory when it contains unrelated files.
+            pass
+    except OSError as error:
+        print(f"error: unable to delete remctl configuration: {error}", file=sys.stderr)
+        return 1
+
+    print(
+        "Deleted remctl user data: "
+        f"{deleted_credentials} credentials, {deleted_files} configuration files."
+    )
+    return 0
+
+
+def uninstall_remctl() -> int:
+    """Uninstall this package and optionally remove its stored user data."""
+    uninstall = _confirm("Uninstall remctl from this Python environment? [y/N]: ")
+    if uninstall is not True:
+        print("Uninstall cancelled.")
+        return 0
+
+    purge_data = _confirm(
+        "Also delete all remctl YAML configuration and indexed Keyring "
+        "credentials? [y/N]: "
+    )
+    if purge_data is None:
+        print("Uninstall cancelled.")
+        return 0
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "--yes", "remctl"],
+            check=False,
+        )
+    except OSError as error:
+        print(f"error: unable to run pip uninstall: {error}", file=sys.stderr)
+        return 1
+    if result.returncode != 0:
+        print("error: pip was unable to uninstall remctl", file=sys.stderr)
+        return result.returncode
+
+    if purge_data:
+        return purge_remctl_data()
+    print("remctl was uninstalled; user configuration and credentials were kept.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
     parser = argparse.ArgumentParser(
@@ -687,6 +785,12 @@ def build_parser() -> argparse.ArgumentParser:
             delete_all=args.all,
         )
     )
+
+    uninstall_parser = subparsers.add_parser(
+        "uninstall",
+        help="uninstall remctl and optionally delete its stored user data",
+    )
+    uninstall_parser.set_defaults(handler=lambda args: uninstall_remctl())
     return parser
 
 
@@ -697,6 +801,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not hasattr(args, "handler"):
         parser.print_help()
         return 0
+    if args.command != "uninstall":
+        try:
+            initialize_config()
+        except OSError as error:
+            print(
+                f"error: unable to initialize remctl configuration: {error}",
+                file=sys.stderr,
+            )
+            return 1
     return args.handler(args)
 
 

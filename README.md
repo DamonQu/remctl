@@ -36,6 +36,32 @@ Confirm that the command is available:
 rctl --version
 ```
 
+Installing the wheel does not execute remctl. The first operational command,
+such as `rctl list` or `rctl add server.example.com`, automatically creates
+`~/.remctl/`, `actions.yaml`, and `workflows.yaml`. Existing configuration files
+are never overwritten. `rctl --help`, `rctl --version`, and `rctl uninstall` do
+not initialize user configuration.
+
+### Uninstall
+
+Use the remctl-managed uninstall command when you want the option to remove
+stored user data as well as the Python package:
+
+```sh
+rctl uninstall
+```
+
+The command first confirms package removal, then asks whether to also delete:
+
+- All credentials tracked by the Keyring index.
+- The Keyring host index.
+- `~/.remctl/actions.yaml` and `~/.remctl/workflows.yaml`.
+
+If other files exist in `~/.remctl/`, the directory and those unrelated files
+are preserved. Declining the second prompt uninstalls the package but keeps all
+configuration and credentials. Direct `pip uninstall remctl` only removes the
+Python package and cannot display remctl's user-data prompt.
+
 For development, install the source tree in editable mode:
 
 ```sh
@@ -270,7 +296,23 @@ available and cannot be overridden:
 | `docker-image-load` | None | Load the uploaded Docker image archive. |
 | `restart-container` | `container` | Restart a Docker container. |
 
-Define custom actions in `~/.remctl.actions.yaml`:
+On first use, remctl creates `~/.remctl/actions.yaml` with protected references
+to all built-in actions:
+
+```yaml
+version: 1
+actions:
+  copy:
+    builtin: true
+  restart-service:
+    builtin: true
+  docker-image-load:
+    builtin: true
+  restart-container:
+    builtin: true
+```
+
+Add custom actions to the same mapping when needed:
 
 ```yaml
 version: 1
@@ -294,7 +336,25 @@ commands and must not be writable by untrusted users.
 
 ### Workflows
 
-Define workflows in `~/.remctl.workflows.yaml`:
+On first use, remctl creates `~/.remctl/workflows.yaml` with a ready-to-use
+Docker image workflow:
+
+```yaml
+version: 1
+workflows:
+  load-image:
+    cleanup: always
+    steps:
+      - action: docker-image-load
+```
+
+Run it after uploading an image archive:
+
+```sh
+rctl deploy --post-workflow load-image image.tar server.example.com
+```
+
+Add further workflows to the same `workflows` mapping. For example:
 
 ```yaml
 version: 1
@@ -308,11 +368,6 @@ workflows:
       - action: restart-service
         with:
           service: hcdadmin
-
-  load-image:
-    cleanup: success
-    steps:
-      - action: docker-image-load
 ```
 
 Every workflow requires at least one step and one cleanup policy:

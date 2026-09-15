@@ -2,9 +2,11 @@
 
 import contextlib
 import io
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import keyring
@@ -15,6 +17,11 @@ from remctl.workflow import WorkflowConfigError
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.initialize_config_patcher = patch("remctl.cli.initialize_config")
+        self.initialize_config = self.initialize_config_patcher.start()
+        self.addCleanup(self.initialize_config_patcher.stop)
+
     def test_no_arguments_prints_help(self) -> None:
         output = io.StringIO()
 
@@ -23,6 +30,30 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("usage: rctl", output.getvalue())
+        self.initialize_config.assert_not_called()
+
+    def test_normal_command_initializes_configuration(self) -> None:
+        with (
+            patch("remctl.cli.load_host_index", return_value={}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            exit_code = main(["list"])
+
+        self.assertEqual(exit_code, 0)
+        self.initialize_config.assert_called_once_with()
+
+    def test_configuration_initialization_failure_stops_command(self) -> None:
+        error = io.StringIO()
+        self.initialize_config.side_effect = PermissionError("denied")
+        with (
+            patch("remctl.cli.load_host_index") as load_index,
+            contextlib.redirect_stderr(error),
+        ):
+            exit_code = main(["list"])
+
+        self.assertEqual(exit_code, 1)
+        load_index.assert_not_called()
+        self.assertIn("unable to initialize", error.getvalue())
 
     def test_add_host_saves_credential_in_keyring(self) -> None:
         output = io.StringIO()
@@ -610,6 +641,130 @@ class CliTests(unittest.TestCase):
 
         register_host.assert_called_once_with("example.com", "alice")
         unregister_host.assert_called_once_with("example.com", "alice")
+
+    def test_uninstall_can_keep_user_data(self) -> None:
+        output = io.StringIO()
+        with (
+            patch("builtins.input", side_effect=["yes", "no"]),
+            patch(
+                "remctl.cli.subprocess.run",
+                return_value=SimpleNamespace(returncode=0),
+            ) as run,
+            patch("remctl.cli.purge_remctl_data") as purge,
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["uninstall"])
+
+        self.assertEqual(exit_code, 0)
+        self.initialize_config.assert_not_called()
+        purge.assert_not_called()
+        run.assert_called_once_with(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "uninstall",
+                "--yes",
+                "remctl",
+            ],
+            check=False,
+        )
+        self.assertIn("configuration and credentials were kept", output.getvalue())
+
+    def test_uninstall_can_purge_user_data(self) -> None:
+        with (
+            patch("builtins.input", side_effect=["yes", "yes"]),
+            patch(
+                "remctl.cli.subprocess.run",
+                return_value=SimpleNamespace(returncode=0),
+            ),
+            patch("remctl.cli.purge_remctl_data", return_value=0) as purge,
+        ):
+            exit_code = main(["uninstall"])
+
+        self.assertEqual(exit_code, 0)
+        purge.assert_called_once_with()
+
+    def test_uninstall_can_be_cancelled(self) -> None:
+        output = io.StringIO()
+        with (
+            patch("builtins.input", return_value="no"),
+            patch("remctl.cli.subprocess.run") as run,
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["uninstall"])
+
+        self.assertEqual(exit_code, 0)
+        run.assert_not_called()
+
+    def test_uninstall_does_not_purge_data_when_pip_fails(self) -> None:
+        error = io.StringIO()
+        with (
+            patch("builtins.input", side_effect=["yes", "yes"]),
+            patch(
+                "remctl.cli.subprocess.run",
+                return_value=SimpleNamespace(returncode=1),
+            ),
+            patch("remctl.cli.purge_remctl_data") as purge,
+            contextlib.redirect_stderr(error),
+        ):
+            exit_code = main(["uninstall"])
+
+        self.assertEqual(exit_code, 1)
+        purge.assert_not_called()
+        self.assertIn("unable to uninstall", error.getvalue())
+
+    def test_interrupting_user_data_prompt_cancels_uninstall(self) -> None:
+        output = io.StringIO()
+        error = io.StringIO()
+        with (
+            patch("builtins.input", side_effect=["yes", KeyboardInterrupt]),
+            patch("remctl.cli.subprocess.run") as run,
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(error),
+        ):
+            exit_code = main(["uninstall"])
+
+        self.assertEqual(exit_code, 0)
+        run.assert_not_called()
+        self.assertIn("cancelled", output.getvalue())
+
+    def test_purge_deletes_yaml_and_indexed_keyring_credentials(self) -> None:
+        from remctl.cli import purge_remctl_data
+
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = Path(directory) / ".remctl"
+            config_dir.mkdir()
+            actions_path = config_dir / "actions.yaml"
+            workflows_path = config_dir / "workflows.yaml"
+            unrelated_path = config_dir / "notes.txt"
+            actions_path.write_text("actions", encoding="utf-8")
+            workflows_path.write_text("workflows", encoding="utf-8")
+            unrelated_path.write_text("keep", encoding="utf-8")
+            with (
+                patch(
+                    "remctl.cli.load_host_index",
+                    return_value={"example.com": ["alice", "root"]},
+                ),
+                patch("remctl.cli.keyring.get_password", return_value="secret"),
+                patch("remctl.cli.keyring.delete_password") as delete_password,
+                patch("remctl.cli.CONFIG_DIR", config_dir),
+                patch("remctl.cli.ACTIONS_PATH", actions_path),
+                patch("remctl.cli.WORKFLOWS_PATH", workflows_path),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = purge_remctl_data()
+
+            self.assertFalse(actions_path.exists())
+            self.assertFalse(workflows_path.exists())
+            self.assertTrue(unrelated_path.exists())
+
+        self.assertEqual(exit_code, 0)
+        delete_password.assert_any_call("remctl:example.com", "alice")
+        delete_password.assert_any_call("remctl:example.com", "root")
+        delete_password.assert_any_call("remctl:index", "hosts")
+        self.assertIn("2 credentials, 2 configuration files", output.getvalue())
 
 
 if __name__ == "__main__":
