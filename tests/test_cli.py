@@ -310,6 +310,74 @@ class CliTests(unittest.TestCase):
         run_ssh.assert_not_called()
         self.assertIn("specify --user", error.getvalue())
 
+    def test_ssh_offers_to_add_missing_credential_and_continues(self) -> None:
+        output = io.StringIO()
+        with (
+            patch("remctl.cli.load_host_index", return_value={}),
+            patch(
+                "builtins.input", side_effect=["yes", "alice"]
+            ) as user_input,
+            patch("remctl.cli.getpass.getpass", return_value="secret"),
+            patch("remctl.cli.validate_ssh_credential", return_value=True) as validate,
+            patch("remctl.cli.save_host_credential") as save,
+            patch("remctl.cli.run_ssh", return_value=0) as run_ssh,
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["ssh", "new.example.com"])
+
+        self.assertEqual(exit_code, 0)
+        validate.assert_called_once_with(
+            "new.example.com", "alice", "secret", debug=False
+        )
+        save.assert_called_once_with("new.example.com", "alice", "secret")
+        run_ssh.assert_called_once_with("new.example.com", "alice", "secret")
+        self.assertIn("Add it now", user_input.call_args_list[0].args[0])
+        self.assertIn("Credential saved", output.getvalue())
+
+    def test_ssh_does_not_continue_when_new_credential_is_invalid(self) -> None:
+        error = io.StringIO()
+        with (
+            patch("remctl.cli.load_host_index", return_value={}),
+            patch("builtins.input", side_effect=["yes", "alice"]),
+            patch("remctl.cli.getpass.getpass", return_value="wrong"),
+            patch("remctl.cli.validate_ssh_credential", return_value=False),
+            patch("remctl.cli.save_host_credential") as save,
+            patch("remctl.cli.run_ssh") as run_ssh,
+            contextlib.redirect_stderr(error),
+        ):
+            exit_code = main(["ssh", "new.example.com"])
+
+        self.assertEqual(exit_code, 1)
+        save.assert_not_called()
+        run_ssh.assert_not_called()
+        self.assertIn("validation failed", error.getvalue())
+
+    def test_exec_uses_explicit_username_when_adding_credential(self) -> None:
+        output = io.StringIO()
+        with (
+            patch("remctl.cli.load_host_index", return_value={}),
+            patch("remctl.cli.keyring.get_password", return_value=None),
+            patch("builtins.input", return_value="yes"),
+            patch("remctl.cli.getpass.getpass", return_value="secret"),
+            patch("remctl.cli.validate_ssh_credential", return_value=True),
+            patch("remctl.cli.save_host_credential") as save,
+            patch("remctl.cli.run_ssh", return_value=0) as run_ssh,
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(
+                ["exec", "--user", "root", "new.example.com", "hostname"]
+            )
+
+        self.assertEqual(exit_code, 0)
+        save.assert_called_once_with("new.example.com", "root", "secret")
+        run_ssh.assert_called_once_with(
+            "new.example.com",
+            "root",
+            "secret",
+            remote_command=("hostname",),
+            interactive=False,
+        )
+
     def test_exec_runs_remote_command_and_returns_ssh_exit_code(self) -> None:
         with (
             patch(
@@ -439,6 +507,7 @@ class CliTests(unittest.TestCase):
             with (
                 patch("remctl.cli.load_host_index", return_value={}),
                 patch("remctl.cli.deploy_many") as deploy_many,
+                patch("builtins.input", return_value="no"),
                 contextlib.redirect_stderr(error),
             ):
                 exit_code = main(["deploy", str(artifact), "10.0.0.11"])
@@ -446,6 +515,48 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         deploy_many.assert_not_called()
         self.assertIn("no credential found", error.getvalue())
+
+    def test_deploy_collects_and_saves_missing_credentials_before_transfer(
+        self,
+    ) -> None:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "image.tar"
+            artifact.write_bytes(b"image")
+            with (
+                patch("remctl.cli.load_host_index", return_value={}),
+                patch(
+                    "builtins.input",
+                    side_effect=["yes", "alice", "yes", "bob"],
+                ),
+                patch(
+                    "remctl.cli.getpass.getpass",
+                    side_effect=["first-secret", "second-secret"],
+                ),
+                patch("remctl.cli.validate_ssh_credential", return_value=True),
+                patch("remctl.cli.save_host_credential") as save,
+                patch(
+                    "remctl.cli.deploy_many",
+                    return_value=[
+                        DeployResult("host-one", True, "uploaded"),
+                        DeployResult("host-two", True, "uploaded"),
+                    ],
+                ) as deploy_many,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = main(
+                    ["deploy", str(artifact), "host-one", "host-two"]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(save.call_count, 2)
+        save.assert_any_call("host-one", "alice", "first-secret")
+        save.assert_any_call("host-two", "bob", "second-secret")
+        targets = deploy_many.call_args.args[1]
+        self.assertEqual(
+            [(target.host, target.username) for target in targets],
+            [("host-one", "alice"), ("host-two", "bob")],
+        )
 
     def test_deploy_rejects_invalid_workflow_before_reading_credentials(self) -> None:
         error = io.StringIO()

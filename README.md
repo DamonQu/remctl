@@ -83,6 +83,22 @@ rctl scp push ./artifact.jar server.example.com /tmp/artifact.jar
 The first connection may show an OpenSSH host fingerprint. Verify it through a
 trusted channel before accepting it.
 
+Commands that connect to an unregistered host do not require a separate
+`rctl add` first. `ssh`, `exec`, `scp`, and `deploy` offer to collect, validate,
+and save a missing credential before continuing:
+
+```text
+No saved credential for server.example.com. Add it now? [y/N]: y
+username: alice
+password:
+Credential saved for alice@server.example.com
+```
+
+If `--user` was supplied, that username is reused and only the password is
+requested. Declining the prompt leaves Keyring unchanged and cancels the remote
+operation. Hosts with multiple stored accounts still require an explicit
+`--user` selection.
+
 ## Credential management
 
 ### Add credentials

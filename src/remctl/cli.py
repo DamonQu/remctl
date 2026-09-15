@@ -138,32 +138,95 @@ def delete_host_credential(host: str, username: str, password: str) -> None:
         raise
 
 
-def add_host(host: str, *, debug: bool = False) -> int:
-    """Prompt for and securely store a host credential."""
-    username = input("username: ").strip()
+def _prompt_and_save_credential(
+    host: str,
+    username: str | None = None,
+    *,
+    debug: bool = False,
+) -> tuple[HostCredential | None, int]:
+    """Prompt for, validate, and save one credential."""
+    try:
+        if username is None:
+            username = input("username: ").strip()
+    except KeyboardInterrupt:
+        print("\nCredential entry interrupted.", file=sys.stderr)
+        return None, 130
+    except EOFError:
+        print("error: unable to read credential", file=sys.stderr)
+        return None, 2
+
     if not username:
         print("error: username cannot be empty", file=sys.stderr)
-        return 2
+        return None, 2
 
-    password = getpass.getpass("password: ")
+    try:
+        password = getpass.getpass("password: ")
+    except KeyboardInterrupt:
+        print("\nCredential entry interrupted.", file=sys.stderr)
+        return None, 130
+    except EOFError:
+        print("error: unable to read credential", file=sys.stderr)
+        return None, 2
+
     if not password:
         print("error: password cannot be empty", file=sys.stderr)
-        return 2
+        return None, 2
 
     if debug:
         print(f"Validating SSH credential for {username}@{host}...")
     if not validate_ssh_credential(host, username, password, debug=debug):
         print("error: SSH credential validation failed", file=sys.stderr)
-        return 1
+        return None, 1
 
     try:
         save_host_credential(host, username, password)
     except (keyring.errors.KeyringError, ValueError) as error:
         print(f"error: unable to save credential: {error}", file=sys.stderr)
-        return 1
+        return None, 1
 
     print(f"Credential saved for {username}@{host}")
-    return 0
+    return HostCredential(username, password), 0
+
+
+def add_host(host: str, *, debug: bool = False) -> int:
+    """Prompt for and securely store a host credential."""
+    _, exit_code = _prompt_and_save_credential(host, debug=debug)
+    return exit_code
+
+
+def resolve_host_credential(
+    host: str,
+    index: dict[str, list[str]],
+    username: str | None = None,
+) -> tuple[HostCredential | None, int]:
+    """Resolve a credential, offering to add it when none is stored."""
+    usernames = index.get(host, [])
+    if username is None:
+        if len(usernames) > 1:
+            print(
+                f"error: multiple credentials found for {host}; specify --user",
+                file=sys.stderr,
+            )
+            return None, 2
+        if len(usernames) == 1:
+            username = usernames[0]
+
+    credential = (
+        load_host_credential(host, username) if username is not None else None
+    )
+    if credential is not None:
+        return credential, 0
+
+    identity = f"{username}@{host}" if username is not None else host
+    confirmed = _confirm(
+        f"No saved credential for {identity}. Add it now? [y/N]: "
+    )
+    if confirmed is None:
+        return None, 130
+    if not confirmed:
+        print(f"error: no credential found for {identity}", file=sys.stderr)
+        return None, 1
+    return _prompt_and_save_credential(host, username)
 
 
 def reindex_hosts() -> int:
@@ -208,29 +271,13 @@ def ssh_host(host: str, username: str | None = None) -> int:
     """Open an interactive SSH session using a stored credential."""
     try:
         index = load_host_index()
-        usernames = index.get(host, [])
-        if username is None:
-            if len(usernames) > 1:
-                print(
-                    "error: multiple credentials found; specify --user",
-                    file=sys.stderr,
-                )
-                return 2
-            if len(usernames) == 1:
-                username = usernames[0]
-
-        if username is None:
-            print(f"error: no credential found for {host}", file=sys.stderr)
-            return 1
-
-        credential = load_host_credential(host, username)
+        credential, exit_code = resolve_host_credential(host, index, username)
     except (keyring.errors.KeyringError, ValueError) as error:
         print(f"error: unable to read credential: {error}", file=sys.stderr)
         return 1
 
     if credential is None:
-        print(f"error: no credential found for {username}@{host}", file=sys.stderr)
-        return 1
+        return exit_code
     return run_ssh(host, credential.username, credential.password)
 
 
@@ -249,29 +296,13 @@ def exec_host(
 
     try:
         index = load_host_index()
-        usernames = index.get(host, [])
-        if username is None:
-            if len(usernames) > 1:
-                print(
-                    "error: multiple credentials found; specify --user",
-                    file=sys.stderr,
-                )
-                return 2
-            if len(usernames) == 1:
-                username = usernames[0]
-
-        if username is None:
-            print(f"error: no credential found for {host}", file=sys.stderr)
-            return 1
-
-        credential = load_host_credential(host, username)
+        credential, exit_code = resolve_host_credential(host, index, username)
     except (keyring.errors.KeyringError, ValueError) as error:
         print(f"error: unable to read credential: {error}", file=sys.stderr)
         return 1
 
     if credential is None:
-        print(f"error: no credential found for {username}@{host}", file=sys.stderr)
-        return 1
+        return exit_code
     return run_ssh(
         host,
         credential.username,
@@ -306,30 +337,9 @@ def deploy_hosts(
     try:
         index = load_host_index()
         for host in unique_hosts:
-            usernames = index.get(host, [])
-            selected_username = username
-            if selected_username is None:
-                if len(usernames) > 1:
-                    print(
-                        f"error: multiple credentials found for {host}; "
-                        "specify --user",
-                        file=sys.stderr,
-                    )
-                    return 2
-                if len(usernames) == 1:
-                    selected_username = usernames[0]
-
-            if selected_username is None:
-                print(f"error: no credential found for {host}", file=sys.stderr)
-                return 1
-
-            credential = load_host_credential(host, selected_username)
+            credential, exit_code = resolve_host_credential(host, index, username)
             if credential is None:
-                print(
-                    f"error: no credential found for {selected_username}@{host}",
-                    file=sys.stderr,
-                )
-                return 1
+                return exit_code
             targets.append(
                 DeployTarget(host, credential.username, credential.password)
             )
@@ -372,28 +382,13 @@ def scp_transfer(
 
     try:
         index = load_host_index()
-        usernames = index.get(host, [])
-        if username is None:
-            if len(usernames) > 1:
-                print(
-                    "error: multiple credentials found; specify --user",
-                    file=sys.stderr,
-                )
-                return 2
-            if len(usernames) == 1:
-                username = usernames[0]
-
-        if username is None:
-            print(f"error: no credential found for {host}", file=sys.stderr)
-            return 1
-        credential = load_host_credential(host, username)
+        credential, exit_code = resolve_host_credential(host, index, username)
     except (keyring.errors.KeyringError, ValueError) as error:
         print(f"error: unable to read credential: {error}", file=sys.stderr)
         return 1
 
     if credential is None:
-        print(f"error: no credential found for {username}@{host}", file=sys.stderr)
-        return 1
+        return exit_code
 
     display = ProgressDisplay([host])
     phase = "pushing" if direction == "push" else "pulling"
