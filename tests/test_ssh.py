@@ -3,6 +3,7 @@
 import contextlib
 import io
 import os
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,24 @@ class SshTests(unittest.TestCase):
             valid = validate_ssh_credential("10.0.0.11", "root", "secret")
 
         self.assertTrue(valid)
+        run_ssh.assert_called_once()
+        args = run_ssh.call_args.args
+        kwargs = run_ssh.call_args.kwargs
+        self.assertEqual(args, ("10.0.0.11", "root", "secret"))
+        self.assertFalse(kwargs["interactive"])
+        self.assertTrue(kwargs["authentication_only"])
+        self.assertIsInstance(kwargs["output"], io.StringIO)
+
+    def test_validation_debug_keeps_openssh_output_visible(self) -> None:
+        with patch("remctl.ssh.run_ssh", return_value=0) as run_ssh:
+            valid = validate_ssh_credential(
+                "10.0.0.11",
+                "root",
+                "secret",
+                debug=True,
+            )
+
+        self.assertTrue(valid)
         run_ssh.assert_called_once_with(
             "10.0.0.11",
             "root",
@@ -27,10 +46,22 @@ class SshTests(unittest.TestCase):
         )
 
     def test_validation_rejects_failed_login(self) -> None:
-        with patch("remctl.ssh.run_ssh", return_value=255):
+        terminal_output = io.StringIO()
+
+        def failed_login(*args, **kwargs):
+            kwargs["output"].write("debug1: authentication failed\n")
+            print("error: internal SSH failure", file=sys.stderr)
+            return 255
+
+        with (
+            patch("remctl.ssh.run_ssh", side_effect=failed_login),
+            contextlib.redirect_stdout(terminal_output),
+            contextlib.redirect_stderr(terminal_output),
+        ):
             valid = validate_ssh_credential("10.0.0.11", "root", "wrong")
 
         self.assertFalse(valid)
+        self.assertEqual(terminal_output.getvalue(), "")
 
     def test_authentication_only_succeeds_on_authenticated_event(self) -> None:
         child = MagicMock()
@@ -51,6 +82,37 @@ class SshTests(unittest.TestCase):
         self.assertIn("-v", arguments)
         child.sendline.assert_called_once_with("secret")
         child.close.assert_called_once_with(force=True)
+
+    def test_quiet_validation_shows_host_fingerprint_confirmation(self) -> None:
+        child = MagicMock()
+        child.expect.side_effect = [1, 0, 2]
+        child.before = (
+            "debug1: noisy diagnostic\r\n"
+            "The authenticity of host 'example.com' can't be established.\r\n"
+            "ED25519 key fingerprint is SHA256:abc123.\r\n"
+            "This key is not known by any other names.\r\n"
+        )
+        child.after = "Are you sure you want to continue connecting (yes/no)? "
+
+        with (
+            patch("remctl.ssh.pexpect.spawn", return_value=child),
+            patch("builtins.input", return_value="yes") as user_input,
+        ):
+            exit_code = _run_ssh_once(
+                "example.com",
+                "alice",
+                "secret",
+                interactive=False,
+                authentication_only=True,
+                output=io.StringIO(),
+            )
+
+        self.assertEqual(exit_code, 0)
+        prompt = user_input.call_args.args[0]
+        self.assertIn("SHA256:abc123", prompt)
+        self.assertIn("Are you sure", prompt)
+        self.assertNotIn("debug1", prompt)
+        self.assertEqual(child.sendline.call_args_list[0].args[0], "yes")
 
     def test_changed_host_key_can_be_removed_and_retried(self) -> None:
         output = io.StringIO()

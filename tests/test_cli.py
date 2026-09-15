@@ -2,12 +2,15 @@
 
 import contextlib
 import io
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import keyring
 
 from remctl.cli import HostCredential, main
+from remctl.deploy import DeployOperation, DeployResult
 
 
 class CliTests(unittest.TestCase):
@@ -26,7 +29,9 @@ class CliTests(unittest.TestCase):
         with (
             patch("builtins.input", return_value="alice"),
             patch("remctl.cli.getpass.getpass", return_value="secret"),
-            patch("remctl.cli.validate_ssh_credential", return_value=True),
+            patch(
+                "remctl.cli.validate_ssh_credential", return_value=True
+            ) as validate,
             patch("remctl.cli.keyring.get_password", return_value=None),
             patch("remctl.cli.keyring.set_password") as set_password,
             patch("remctl.cli.register_host") as register_host,
@@ -35,9 +40,38 @@ class CliTests(unittest.TestCase):
             exit_code = main(["add", "example.com"])
 
         self.assertEqual(exit_code, 0)
+        validate.assert_called_once_with(
+            "example.com", "alice", "secret", debug=False
+        )
         set_password.assert_called_once_with("remctl:example.com", "alice", "secret")
         register_host.assert_called_once_with("example.com", "alice")
         self.assertIn("Credential saved for alice@example.com", output.getvalue())
+        self.assertNotIn("Validating SSH", output.getvalue())
+
+    def test_add_host_debug_shows_validation_diagnostics(self) -> None:
+        output = io.StringIO()
+
+        with (
+            patch("builtins.input", return_value="alice"),
+            patch("remctl.cli.getpass.getpass", return_value="secret"),
+            patch(
+                "remctl.cli.validate_ssh_credential", return_value=True
+            ) as validate,
+            patch("remctl.cli.keyring.get_password", return_value=None),
+            patch("remctl.cli.keyring.set_password"),
+            patch("remctl.cli.register_host"),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["add", "example.com", "--debug"])
+
+        self.assertEqual(exit_code, 0)
+        validate.assert_called_once_with(
+            "example.com", "alice", "secret", debug=True
+        )
+        self.assertIn(
+            "Validating SSH credential for alice@example.com",
+            output.getvalue(),
+        )
 
     def test_add_host_does_not_save_invalid_ssh_credential(self) -> None:
         error = io.StringIO()
@@ -56,6 +90,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         set_password.assert_not_called()
         self.assertIn("validation failed", error.getvalue())
+        self.assertNotIn("Validating SSH", output.getvalue())
 
     def test_add_host_rejects_empty_username(self) -> None:
         error = io.StringIO()
@@ -297,6 +332,170 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         run_ssh.assert_not_called()
         self.assertIn("command cannot be empty", error.getvalue())
+
+    def test_deploy_checks_file_before_credentials(self) -> None:
+        error = io.StringIO()
+
+        with (
+            patch("remctl.cli.load_host_index") as load_host_index,
+            patch("remctl.cli.deploy_many") as deploy_many,
+            contextlib.redirect_stderr(error),
+        ):
+            exit_code = main(["deploy", "-f", "missing.bin", "10.0.0.11"])
+
+        self.assertEqual(exit_code, 2)
+        load_host_index.assert_not_called()
+        deploy_many.assert_not_called()
+        self.assertIn("file does not exist", error.getvalue())
+
+    def test_deploy_preflights_credentials_and_runs_multiple_hosts(self) -> None:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "archon.jar"
+            artifact.write_bytes(b"jar")
+            with (
+                patch(
+                    "remctl.cli.load_host_index",
+                    return_value={
+                        "10.0.0.11": ["root"],
+                        "10.0.0.12": ["root"],
+                    },
+                ),
+                patch("remctl.cli.keyring.get_password", return_value="secret"),
+                patch(
+                    "remctl.cli.deploy_many",
+                    return_value=[
+                        DeployResult("10.0.0.11", True, "deployed"),
+                        DeployResult("10.0.0.12", True, "deployed"),
+                    ],
+                ) as deploy_many,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = main(
+                    [
+                        "deploy",
+                        str(artifact),
+                        "10.0.0.11",
+                        "10.0.0.12",
+                        "-a",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        local_path, targets, operation = deploy_many.call_args.args
+        self.assertEqual(local_path.name, "archon.jar")
+        self.assertEqual(
+            [target.host for target in targets],
+            ["10.0.0.11", "10.0.0.12"],
+        )
+        self.assertIs(operation, DeployOperation.ARCHON)
+        self.assertIn("[10.0.0.11] OK", output.getvalue())
+
+    def test_deploy_aborts_before_transfer_when_credential_is_missing(self) -> None:
+        error = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "image.tar"
+            artifact.write_bytes(b"image")
+            with (
+                patch("remctl.cli.load_host_index", return_value={}),
+                patch("remctl.cli.deploy_many") as deploy_many,
+                contextlib.redirect_stderr(error),
+            ):
+                exit_code = main(
+                    ["deploy", "-i", str(artifact), "10.0.0.11"]
+                )
+
+        self.assertEqual(exit_code, 1)
+        deploy_many.assert_not_called()
+        self.assertIn("no credential found", error.getvalue())
+
+    def test_scp_push_transfers_to_requested_remote_path_with_progress(self) -> None:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "artifact.jar"
+            source.write_bytes(b"jar")
+
+            def run_scp(*args, **kwargs):
+                args[5](67, "9.2MB/s")
+                return 0, ""
+
+            with (
+                patch(
+                    "remctl.cli.load_host_index",
+                    return_value={"10.0.0.11": ["root"]},
+                ),
+                patch("remctl.cli.keyring.get_password", return_value="secret"),
+                patch("remctl.cli.run_scp", side_effect=run_scp) as scp,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = main(
+                    [
+                        "scp",
+                        "push",
+                        str(source),
+                        "10.0.0.11",
+                        "/opt/app/",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(scp.call_args.args[4], "/opt/app/")
+        self.assertIn("67%", output.getvalue())
+        self.assertIn("9.2MB/s", output.getvalue())
+        self.assertIn("uploaded", output.getvalue())
+
+    def test_scp_pull_transfers_remote_file_to_local_path(self) -> None:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "server.log"
+
+            def run_scp_pull(*args, **kwargs):
+                args[5](35, "2.1MB/s")
+                return 0, ""
+
+            with (
+                patch(
+                    "remctl.cli.load_host_index",
+                    return_value={"10.0.0.11": ["root"]},
+                ),
+                patch("remctl.cli.keyring.get_password", return_value="secret"),
+                patch(
+                    "remctl.cli.run_scp_pull",
+                    side_effect=run_scp_pull,
+                ) as scp_pull,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = main(
+                    [
+                        "scp",
+                        "pull",
+                        "10.0.0.11",
+                        "/var/log/server.log",
+                        str(destination),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(scp_pull.call_args.args[3], "/var/log/server.log")
+        self.assertEqual(scp_pull.call_args.args[4], destination)
+        self.assertIn("35%", output.getvalue())
+        self.assertIn("2.1MB/s", output.getvalue())
+        self.assertIn("downloaded", output.getvalue())
+
+    def test_scp_push_checks_local_source_before_credentials(self) -> None:
+        error = io.StringIO()
+        with (
+            patch("remctl.cli.load_host_index") as load_host_index,
+            patch("remctl.cli.run_scp") as run_scp,
+            contextlib.redirect_stderr(error),
+        ):
+            exit_code = main(
+                ["scp", "push", "missing.bin", "10.0.0.11", "/tmp/"]
+            )
+
+        self.assertEqual(exit_code, 2)
+        load_host_index.assert_not_called()
+        run_scp.assert_not_called()
 
     def test_reindex_removes_missing_credentials(self) -> None:
         output = io.StringIO()

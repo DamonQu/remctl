@@ -6,11 +6,14 @@ import json
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import keyring
 
 from remctl import __version__
+from remctl.deploy import DeployOperation, DeployTarget, ProgressDisplay, deploy_many
 from remctl.ssh import run_ssh, validate_ssh_credential
+from remctl.transfer import run_scp, run_scp_pull
 
 KEYRING_INDEX_SERVICE = "remctl:index"
 KEYRING_INDEX_ACCOUNT = "hosts"
@@ -125,7 +128,7 @@ def delete_host_credential(host: str, username: str, password: str) -> None:
         raise
 
 
-def add_host(host: str) -> int:
+def add_host(host: str, *, debug: bool = False) -> int:
     """Prompt for and securely store a host credential."""
     username = input("username: ").strip()
     if not username:
@@ -137,8 +140,9 @@ def add_host(host: str) -> int:
         print("error: password cannot be empty", file=sys.stderr)
         return 2
 
-    print(f"Validating SSH credential for {username}@{host}...")
-    if not validate_ssh_credential(host, username, password):
+    if debug:
+        print(f"Validating SSH credential for {username}@{host}...")
+    if not validate_ssh_credential(host, username, password, debug=debug):
         print("error: SSH credential validation failed", file=sys.stderr)
         return 1
 
@@ -267,6 +271,155 @@ def exec_host(
     )
 
 
+def deploy_hosts(
+    file_path: str,
+    hosts: Sequence[str],
+    operation: DeployOperation,
+    username: str | None = None,
+) -> int:
+    """Validate deployment inputs and deploy to all requested hosts."""
+    local_path = Path(file_path).expanduser()
+    if not local_path.is_file():
+        print(f"error: file does not exist: {local_path}", file=sys.stderr)
+        return 2
+
+    unique_hosts = list(dict.fromkeys(hosts))
+    targets: list[DeployTarget] = []
+    try:
+        index = load_host_index()
+        for host in unique_hosts:
+            usernames = index.get(host, [])
+            selected_username = username
+            if selected_username is None:
+                if len(usernames) > 1:
+                    print(
+                        f"error: multiple credentials found for {host}; "
+                        "specify --user",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if len(usernames) == 1:
+                    selected_username = usernames[0]
+
+            if selected_username is None:
+                print(f"error: no credential found for {host}", file=sys.stderr)
+                return 1
+
+            credential = load_host_credential(host, selected_username)
+            if credential is None:
+                print(
+                    f"error: no credential found for {selected_username}@{host}",
+                    file=sys.stderr,
+                )
+                return 1
+            targets.append(
+                DeployTarget(host, credential.username, credential.password)
+            )
+    except (keyring.errors.KeyringError, ValueError) as error:
+        print(f"error: unable to read credential: {error}", file=sys.stderr)
+        return 1
+
+    results = deploy_many(local_path, targets, operation)
+    failed = False
+    print("\nDeployment results:")
+    for result in results:
+        status = "OK" if result.success else "FAILED"
+        print(f"[{result.host}] {status}: {result.summary}")
+        for line in result.output.strip().splitlines():
+            print(f"[{result.host}] {line}")
+        failed = failed or not result.success
+    return 1 if failed else 0
+
+
+def scp_transfer(
+    direction: str,
+    host: str,
+    source: str,
+    destination: str,
+    username: str | None = None,
+    *,
+    recursive: bool = False,
+) -> int:
+    """Push or pull a path with a stored host credential."""
+    local_path = Path(source if direction == "push" else destination).expanduser()
+    if direction == "push" and not local_path.exists():
+        print(f"error: local path does not exist: {local_path}", file=sys.stderr)
+        return 2
+    if direction == "pull" and not local_path.parent.is_dir():
+        print(
+            f"error: local destination directory does not exist: {local_path.parent}",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        index = load_host_index()
+        usernames = index.get(host, [])
+        if username is None:
+            if len(usernames) > 1:
+                print(
+                    "error: multiple credentials found; specify --user",
+                    file=sys.stderr,
+                )
+                return 2
+            if len(usernames) == 1:
+                username = usernames[0]
+
+        if username is None:
+            print(f"error: no credential found for {host}", file=sys.stderr)
+            return 1
+        credential = load_host_credential(host, username)
+    except (keyring.errors.KeyringError, ValueError) as error:
+        print(f"error: unable to read credential: {error}", file=sys.stderr)
+        return 1
+
+    if credential is None:
+        print(f"error: no credential found for {username}@{host}", file=sys.stderr)
+        return 1
+
+    display = ProgressDisplay([host])
+    phase = "pushing" if direction == "push" else "pulling"
+    display.update(host, phase, 0, "0B/s")
+
+    def progress(percent: int, rate: str) -> None:
+        display.update(host, phase, percent, rate)
+
+    if direction == "push":
+        exit_code, transcript = run_scp(
+            local_path,
+            host,
+            credential.username,
+            credential.password,
+            destination,
+            progress,
+            recursive=recursive or local_path.is_dir(),
+        )
+    else:
+        exit_code, transcript = run_scp_pull(
+            host,
+            credential.username,
+            credential.password,
+            source,
+            local_path,
+            progress,
+            recursive=recursive,
+        )
+
+    if exit_code != 0:
+        display.update(host, "transfer failed")
+        print(f"error: scp {direction} failed for {host}", file=sys.stderr)
+        for line in transcript.strip().splitlines():
+            print(f"[{host}] {line}", file=sys.stderr)
+        return exit_code
+
+    display.update(host, "completed", 100)
+    if direction == "push":
+        print(f"[{host}] uploaded {local_path} to {destination}")
+    else:
+        print(f"[{host}] downloaded {source} to {local_path}")
+    return 0
+
+
 def get_host(host: str, username: str | None = None) -> int:
     """Show credentials stored for a host without revealing passwords."""
     try:
@@ -388,7 +541,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="save credentials for a remote host",
     )
     add_parser.add_argument("host", help="hostname or IP address")
-    add_parser.set_defaults(handler=lambda args: add_host(args.host))
+    add_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="show OpenSSH credential validation diagnostics",
+    )
+    add_parser.set_defaults(handler=lambda args: add_host(args.host, debug=args.debug))
 
     get_parser = subparsers.add_parser(
         "get",
@@ -435,6 +593,98 @@ def build_parser() -> argparse.ArgumentParser:
             args.host,
             args.remote_command,
             args.user,
+        )
+    )
+
+    deploy_parser = subparsers.add_parser(
+        "deploy",
+        help="transfer and deploy a file to one or more hosts",
+    )
+    deploy_parser.add_argument("-u", "--user", help="username to use on all hosts")
+    operation_group = deploy_parser.add_mutually_exclusive_group(required=True)
+    operation_group.add_argument(
+        "-i",
+        "--image",
+        dest="operation",
+        action="store_const",
+        const=DeployOperation.IMAGE,
+        help="load a Docker image archive",
+    )
+    operation_group.add_argument(
+        "-a",
+        "--archon",
+        dest="operation",
+        action="store_const",
+        const=DeployOperation.ARCHON,
+        help="deploy the Archon jar and restart hcdadmin",
+    )
+    operation_group.add_argument(
+        "-m",
+        "--hcdmgmt",
+        dest="operation",
+        action="store_const",
+        const=DeployOperation.HCDMGMT,
+        help="deploy the hcdmgmt jar and restart hcdmgmt",
+    )
+    operation_group.add_argument(
+        "-f",
+        "--file-only",
+        dest="operation",
+        action="store_const",
+        const=DeployOperation.FILE,
+        help="only upload the file and print its remote temporary path",
+    )
+    deploy_parser.add_argument("file", help="local file to transfer")
+    deploy_parser.add_argument("hosts", nargs="+", help="target hosts")
+    deploy_parser.set_defaults(
+        handler=lambda args: deploy_hosts(
+            args.file,
+            args.hosts,
+            args.operation,
+            args.user,
+        )
+    )
+
+    scp_parser = subparsers.add_parser(
+        "scp",
+        help="push or pull files with a saved credential",
+    )
+    scp_subparsers = scp_parser.add_subparsers(dest="scp_command", required=True)
+
+    push_parser = scp_subparsers.add_parser("push", help="upload a local path")
+    push_parser.add_argument("-u", "--user", help="username to use")
+    push_parser.add_argument("source", help="local source file or directory")
+    push_parser.add_argument("host", help="remote hostname or IP address")
+    push_parser.add_argument("destination", help="remote destination path")
+    push_parser.set_defaults(
+        handler=lambda args: scp_transfer(
+            "push",
+            args.host,
+            args.source,
+            args.destination,
+            args.user,
+        )
+    )
+
+    pull_parser = scp_subparsers.add_parser("pull", help="download a remote path")
+    pull_parser.add_argument("-u", "--user", help="username to use")
+    pull_parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="download a directory recursively",
+    )
+    pull_parser.add_argument("host", help="remote hostname or IP address")
+    pull_parser.add_argument("source", help="remote source file or directory")
+    pull_parser.add_argument("destination", help="local destination path")
+    pull_parser.set_defaults(
+        handler=lambda args: scp_transfer(
+            "pull",
+            args.host,
+            args.source,
+            args.destination,
+            args.user,
+            recursive=args.recursive,
         )
     )
 

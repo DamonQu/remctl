@@ -12,10 +12,12 @@ operations. Its command-line program is `rctl`.
 - Delete a host's credentials from the system credential store.
 - Validate credentials with a real SSH login before saving them.
 - Open interactive SSH sessions with saved credentials.
+- Push and pull files with SCP, including live progress and bandwidth.
+- Deploy files and service artifacts to multiple hosts concurrently.
 - Use macOS Keychain through Python's `keyring` package.
 - Keep passwords out of project files and shell command history.
 
-SCP and rsync commands will be added in later versions.
+Standalone rsync commands will be added in a later version.
 
 ## Add a host
 
@@ -32,7 +34,6 @@ The command prompts interactively:
 ```text
 username: alice
 password:
-Validating SSH credential for alice@server.example.com...
 Credential saved for alice@server.example.com
 ```
 
@@ -45,6 +46,13 @@ Before saving, `rctl add` opens an authentication-only OpenSSH connection. It
 does not start a remote shell or execute a remote command. A failed login is not
 stored. On a first connection, review and confirm the host fingerprint shown by
 OpenSSH.
+
+Credential validation is quiet by default: only the final success or failure is
+shown. Enable OpenSSH diagnostics when troubleshooting:
+
+```sh
+rctl add server.example.com --debug
+```
 
 ## Open an SSH session
 
@@ -100,6 +108,113 @@ rctl exec 10.0.0.11 -- -example-command
 
 The command is passed as arguments to OpenSSH; the saved password is never
 included in the process arguments.
+
+## Transfer files with SCP
+
+Upload a local file to a specific remote path:
+
+```sh
+rctl scp push ./artifact.jar 10.0.0.11 /tmp/artifact.jar
+```
+
+Local directories are detected automatically and uploaded recursively:
+
+```sh
+rctl scp push ./release 10.0.0.11 /opt/releases/
+```
+
+Download a remote file to a local path:
+
+```sh
+rctl scp pull 10.0.0.11 /var/log/hcdadmin.log ./hcdadmin.log
+```
+
+Download a remote directory recursively:
+
+```sh
+rctl scp pull --recursive 10.0.0.11 /var/log/hcdadmin ./logs
+```
+
+For a host with multiple credentials, select one explicitly:
+
+```sh
+rctl scp push --user root ./artifact.jar 10.0.0.11 /tmp/
+rctl scp pull --user root 10.0.0.11 /tmp/result.txt ./result.txt
+```
+
+Both directions display continuously updated transfer percentage and bandwidth:
+
+```text
+[10.0.0.11] pushing  67% 9.2MB/s
+[10.0.0.11] completed 100%
+```
+
+SCP uses the same Keychain credential and host-key verification behavior as
+`rctl ssh`. Passwords are sent through the pseudo-terminal and never placed in
+the SCP process arguments.
+
+## Deploy files and artifacts
+
+`rctl deploy` checks that the local file and all target credentials exist before
+starting. Targets run concurrently, while the terminal displays each host's
+current step, transfer percentage, and bandwidth.
+
+Upload and load a Docker image archive, then remove the temporary archive:
+
+```sh
+rctl deploy -i image.tar 10.0.0.11 10.0.0.12
+```
+
+The result includes every `Loaded image:` or `Loaded image ID:` reference
+reported by `docker image load --input`.
+
+Deploy the Archon jar and restart `hcdadmin`:
+
+```sh
+rctl deploy -a archon.jar 10.0.0.11 10.0.0.12
+```
+
+The jar is copied to:
+
+```text
+/usr/share/hcdserver/hcdadmin/archon-1.0-SNAPSHOT-jar-with-dependencies.jar
+```
+
+Deploy the hcdmgmt jar and restart `hcdmgmt`:
+
+```sh
+rctl deploy -m hcdmgmt.jar 10.0.0.11 10.0.0.12
+```
+
+The jar is copied to:
+
+```text
+/usr/share/hcdserver/hcdmgmt/hcdmgmt-1.0-SNAPSHOT.jar
+```
+
+Only upload a file and retain it in the generated remote temporary path:
+
+```sh
+rctl deploy -f support-bundle.tar.gz 10.0.0.11 10.0.0.12
+```
+
+For hosts with multiple credentials, select the same username on all targets:
+
+```sh
+rctl deploy --user root -a archon.jar 10.0.0.11 10.0.0.12
+```
+
+Operation flags are mutually exclusive:
+
+- `-i`, `--image`: load a Docker image archive.
+- `-a`, `--archon`: install the Archon jar and restart `hcdadmin`.
+- `-m`, `--hcdmgmt`: install the hcdmgmt jar and restart `hcdmgmt`.
+- `-f`, `--file-only`: upload only and print the temporary path.
+
+Docker and jar deployments clean up the remote temporary file. File-only mode
+keeps it. Deployment commands require the selected remote account to have
+permission to run `docker`, copy into `/usr/share/hcdserver`, and restart the
+relevant systemd service.
 
 ## Query a host
 
